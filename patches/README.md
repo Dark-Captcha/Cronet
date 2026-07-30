@@ -4,106 +4,45 @@ Changes applied to a Chromium checkout before `libcronet.so` is built.
 `scripts/build_native.sh` applies them in order and refuses to build if one will not apply.
 They target Chromium 150.0.7871.100.
 
-| Patch                             | Tree                        | What it adds                              |
-| --------------------------------- | --------------------------- | ----------------------------------------- |
-| `0001-tls-profile-net.patch`      | `chromium/src`              | The `//net` half of `TlsProfile`          |
-| `0002-tls-profile-boringssl.patch` | `third_party/boringssl/src` | The BoringSSL half of `TlsProfile`        |
+| Patch                              | Tree                        | What it adds                                     |
+| ---------------------------------- | --------------------------- | ------------------------------------------------ |
+| `0001-tls-profile-net.patch`       | `chromium/src`              | The `//net` half of `TlsProfile`                 |
+| `0002-tls-profile-boringssl.patch` | `third_party/boringssl/src` | The BoringSSL half of `TlsProfile`               |
+| `0003-socks5-auth.patch`           | `chromium/src`              | SOCKS5 username/password authentication          |
+| `0004-socks5-udp-quic.patch`       | `chromium/src`              | HTTP/3 through a SOCKS5 proxy's UDP relay        |
 
-## Planned: HTTP/3 through a SOCKS5 proxy
+None of them changes what a destination server sees.
+The TLS fingerprint, the HTTP/2 and HTTP/3 framing and the header order are Chromium's own, whether a request goes direct or through a proxy — measured, not assumed: the same JA4 and the same pinned JA3 come back either way.
+What the last two change is which proxies can be reached at all, and that is a conversation between the client and the proxy that the destination never sees.
 
-Not written yet.
-This section records what was established about the problem so the work can be picked up without re-deriving it; every file and line below was read from Chromium 150.0.7871.100 source, not recalled.
+## 0003: SOCKS5 authentication
 
-### The problem
+Upstream offers only the "no authentication" method, and its proxy URI parser discards any userinfo outright, so `socks5://user:password@host:1080` fails with `ERR_NO_SUPPORTED_PROXIES` (-336) while the rules are still being parsed.
+Residential proxies require authentication and carry country and session selection in the username, so this made them unusable.
 
-A request through any proxy arrives over HTTP/2, never HTTP/3, however many warm-up requests are made and whatever `quic_hints` says.
-Measured across three residential proxy vendors, with a SOCKS5 relay logging every command: six `CONNECT` (0x01) commands and **zero** `UDP ASSOCIATE` (0x03).
-Chromium never attempts QUIC through the proxy at all, so this is not a missing feature at the proxy — it is a decision on the client side.
+Four files:
 
-Nothing reports it.
-`Response.http_version` reads `"h2"` and no error is raised, which is why `require_http3=True` exists in the Python layer: it turns the silence into a failure for callers whose traffic is only worth sending over HTTP/3.
+- **`net/base/proxy_string_util.cc`** keeps the credentials the parser already splits out, for `socks5` only — an HTTP proxy authenticates through its own 407 exchange, so accepting userinfo there would look like it worked and quietly do nothing.
+- **`net/base/proxy_server.{h,cc}`** carries them. The special members move out of line, because chromium-style requires that of a class with non-trivial members.
+- **`net/socket/socks_connect_job.{h,cc}`** passes them to the socket.
+- **`net/socket/socks5_client_socket.{h,cc}`** offers method `0x02` beside `0x00`, and runs the RFC 1929 subnegotiation between the greeting and the handshake.
 
-### Where Chromium decides
+## 0004: HTTP/3 through a SOCKS5 proxy
 
-`net/http/http_stream_factory_job.cc`, in `Job::DoInitConnectionImplQuic()`:
+Upstream carries QUIC over a QUIC proxy and refuses every other kind, in two places, so a proxied request always lands on HTTP/2.
+`net/socket/socks5_udp_client_socket.{h,cc}` adds the missing transport: a `DatagramClientSocket` that resolves the proxy, opens a TCP control connection, greets, authenticates, sends `UDP ASSOCIATE` (RFC 1928, 0x03), and then relays datagrams through the address the proxy names, wrapping each one in the request header of RFC 1928 section 7.
+The control connection stays open for the association's lifetime, because a proxy drops the relay when it closes.
 
-```cpp
-ProxyChain proxy_chain = proxy_info_.proxy_chain();
-if (!proxy_chain.is_direct()) {
-  // We only support proxying QUIC over QUIC. While MASQUE defines mechanisms
-  // to carry QUIC traffic over non-QUIC proxies, the performance of these
-  // mechanisms would be worse than simply using H/1 or H/2 to reach the
-  // destination. The error for an invalid condition should not be user
-  // visible, because the non-alternative Job should be resumed.
-  if (proxy_chain.AnyProxy([](const ProxyServer& s) { return !s.is_quic(); })) {
-    return ERR_NO_SUPPORTED_PROXIES;
-  }
-}
-```
+`IsSocks5UdpProxyChain()` lives beside that socket so the rule has one home; four call sites ask it rather than repeating the test:
 
-Three things follow from that comment, and they shape the whole design:
+- **`net/http/http_stream_factory_job.cc`** — two separate gates return `ERR_NO_SUPPORTED_PROXIES` for a non-QUIC proxy chain, and the earlier one runs first. Relaxing only the later one changes nothing, which is worth knowing before debugging it.
+- **`net/quic/quic_session_pool.cc`** — `CreateSocket()` wraps the datagram socket, and job selection sends a SOCKS5 chain down the direct path. `ProxyJob` builds a QUIC session *to* the proxy and tunnels inside it, which is what a QUIC proxy needs and not what a relay does.
+- **`net/quic/quic_session_attempt.cc`** — an association needs a TCP connection and several round trips before its first datagram, so it always takes the asynchronous branch whatever `kAsyncQuicSession` says.
+- **`net/quic/quic_chromium_client_session.cc`** — the network-migration probe sockets get the same treatment.
 
-Chromium already carries QUIC over a **QUIC** proxy — `is_quic()` chains are supported end to end, so the machinery for proxied QUIC exists and only the SOCKS5 case is excluded.
-The exclusion is a **performance judgement**, not an impossibility.
-And the failure is deliberately invisible, because the non-alternative job is expected to resume — which is precisely the silent downgrade observed.
+### What it needs from the proxy
 
-### What it would take
+The proxy has to answer `UDP ASSOCIATE` and then actually relay.
+`scripts/probe_socks5_udp.py` asks both questions without involving Chromium, and is worth running before anything else.
 
-Two integration points and one new class.
-
-**1. Relax the gate** — `net/http/http_stream_factory_job.cc`, the block above.
-Allow a chain whose proxies are SOCKS5 through to the QUIC path instead of returning `ERR_NO_SUPPORTED_PROXIES`.
-
-**2. Build the socket through the proxy** — `net/quic/quic_session_pool.cc`, `QuicSessionPool::CreateSocket()`:
-
-```cpp
-auto socket = client_socket_factory_->CreateDatagramClientSocket(
-    DatagramSocket::DEFAULT_BIND, net_log, source);
-```
-
-Every QUIC socket comes from here, and `ConnectAndConfigureSocket()` takes a plain `DatagramClientSocket*`, so a SOCKS5-aware implementation of that interface slots in without touching the QUIC session itself.
-
-**3. A new `DatagramClientSocket`** carrying RFC 1928 UDP relaying:
-
-- open a TCP control connection to the proxy, greet, authenticate, then send `UDP ASSOCIATE` (0x03),
-- read `BND.ADDR` and `BND.PORT` from the reply — the relay endpoint datagrams go to,
-- hold the TCP connection open for the lifetime of the association, because the proxy drops the relay when it closes,
-- on write, prefix each datagram with the SOCKS5 UDP header (`RSV RSV FRAG ATYP DST.ADDR DST.PORT` — ten bytes for IPv4), and strip it again on read.
-
-`net/socket/socks5_client_socket.{h,cc}` is a `StreamSocket` with the command hardcoded to `kTunnelCommand`, so it is a reference for the handshake rather than something to extend.
-
-### Authentication comes with it
-
-The same file's class comment reads *"Currently no SOCKSv5 authentication is supported"*, and the client offers only `AUTH_NONE` — confirmed by `tests/test_proxy.py`, where a proxy demanding RFC 1929 credentials is a strict `xfail`.
-
-Residential proxies require authentication, and their usernames carry the country and session selection, so RFC 1929 is not optional for this to be useful.
-It is worth doing on its own: it needs no UDP and no enterprise proxy tier, and it unblocks authenticated residential proxies over HTTP/2 today.
-
-Four files, and the first is the surprising one.
-
-**`net/base/proxy_string_util.cc`**, in `ProxySchemeHostAndPortToProxyServer()`:
-
-```cpp
-if (username_component.is_valid() || password_component.is_valid() ||
-    hostname_component.is_empty()) {
-  return ProxyServer();
-}
-```
-
-Chromium rejects any proxy URI that carries credentials, for every scheme.
-That is why `proxy="socks5://user:password@host:1080"` fails with `ERR_NO_SUPPORTED_PROXIES` (-336) before a connection is attempted: the rule parses to an invalid `ProxyServer`, so the chain has no usable proxy in it.
-The parser already splits the userinfo out — it just throws it away.
-
-**`net/base/proxy_server.{h,cc}`** — carry the username and password that the parser currently discards.
-
-**`net/socket/socks_connect_job.{h,cc}`** — `SOCKSSocketParams` reaches the construction site at `socks_connect_job.cc:179`, which today passes three arguments and would pass the credentials as a fourth.
-
-**`net/socket/socks5_client_socket.{h,cc}`** — offer method `0x02` alongside `0x00` in `kSOCKS5GreetWriteData`, accept it in `DoGreetReadComplete()` where anything but `0x00` is currently an error, and add four states for the RFC 1929 sub-negotiation between the greeting and the existing handshake.
-
-`scripts/probe_socks5_udp.py` implements that same sub-negotiation in Python and is verified against the suite's SOCKS5 server, so it is a working reference for the byte layout.
-
-### Order of work
-
-Authentication first, since it stands alone and is far smaller.
-Then prove a given vendor actually relays QUIC datagrams, using a plain SOCKS5 UDP client outside Chromium — a rebuild is expensive and a vendor whose UDP support is off, or gated behind a tier, would waste all of it.
-Only then the datagram socket and the gate.
+A relay is usually IPv4-only, and an IPv6 destination is then dropped without a reply — the request simply falls back to HTTP/2. That is the failure most likely to be mistaken for the patch not working.

@@ -171,12 +171,19 @@ class _BaseSession:
                 "require_http3=True contradicts http3=False — one asks for "
                 "HTTP/3 and the other switches it off"
             )
-        if require_http3 and proxy:
+        # QUIC reaches a destination through a SOCKS5 proxy's UDP relay, and
+        # through no other kind of proxy — an HTTP proxy tunnels TCP and has
+        # nowhere to put a datagram. Whether a given SOCKS5 proxy actually
+        # relays UDP is only knowable by asking it, so that one is left to fail
+        # per response rather than refused here.
+        if require_http3 and proxy and not proxy.startswith("socks5://"):
             raise ValueError(
-                "require_http3=True cannot be met through a proxy: Chromium "
-                "carries QUIC over no proxy protocol, so it never sends the "
-                "SOCKS5 UDP ASSOCIATE that HTTP/3 would need and every request "
-                "would arrive over HTTP/2. Drop the proxy, or require_http3."
+                "require_http3=True cannot be met through this proxy: QUIC "
+                "travels through a SOCKS5 proxy's UDP relay, and no other "
+                "proxy protocol carries datagrams, so every request would "
+                "arrive over HTTP/2. Use a socks5:// proxy that relays UDP — "
+                "scripts/probe_socks5_udp.py will say whether one does — or "
+                "drop require_http3."
             )
         self.require_http3 = require_http3
         self.headers = Headers(headers)

@@ -92,6 +92,7 @@ apply_patch "$project_root/patches/0001-tls-profile-net.patch" "$chromium_src"
 apply_patch "$project_root/patches/0002-tls-profile-boringssl.patch" \
   "$chromium_src/third_party/boringssl/src"
 apply_patch "$project_root/patches/0003-socks5-auth.patch" "$chromium_src"
+apply_patch "$project_root/patches/0004-socks5-udp-quic.patch" "$chromium_src"
 
 # Replaces whatever was there before, including a symlink left by an older
 # version of this script, so the staged copy always matches native/ exactly.

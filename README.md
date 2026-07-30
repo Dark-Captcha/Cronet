@@ -272,14 +272,25 @@ with Session(quic_hints=["cloudflare-quic.com"]) as session:
 A hint is a bare name, or a name with its port as `("example.com", 443)`.
 Pass `http3=False` to switch QUIC off, and `http2=False` to force HTTP/1.1.
 
-### HTTP/3 does not survive a proxy
+### HTTP/3 through a proxy
 
-A request through a proxy arrives over HTTP/2, never HTTP/3, whatever `quic_hints` says and however many requests have gone before it.
-Chromium carries QUIC over a QUIC proxy only, and declines it for every other kind — it never sends the SOCKS5 `UDP ASSOCIATE` that a UDP relay would need, so the proxy is not what is refusing.
-The reasoning, and what changing it would take, is in [`patches/README.md`](patches/README.md).
+Upstream Chromium carries QUIC over a QUIC proxy and declines every other kind, so a proxied request arrives over HTTP/2 however many times it is tried.
+This library adds the missing path: [`patches/0004-socks5-udp-quic.patch`](patches/0004-socks5-udp-quic.patch) teaches `//net` the SOCKS5 `UDP ASSOCIATE` command of RFC 1928, so QUIC datagrams travel through a SOCKS5 proxy's UDP relay.
 
-Nothing announces this.
-`Response.http_version` reads `"h2"`, no error is raised, and Chromium's own comment says the failure "should not be user visible" because the HTTP/2 attempt is expected to take over.
+```python
+with Session(proxy="socks5://user:password@proxy.example:1080") as session:
+    response = session.get("https://http3.is/")
+    print(response.http_version)
+# h3
+```
+
+Three conditions have to hold, and each fails quietly rather than loudly:
+
+- **The proxy must relay UDP.** Ask it with [`scripts/probe_socks5_udp.py`](scripts/probe_socks5_udp.py); a proxy that answers `command not supported` cannot carry HTTP/3 whatever the client does.
+- **The destination must be reachable over the address family the relay speaks.** Most SOCKS5 relays are IPv4-only, and an IPv6 destination is then dropped by the proxy without a reply, so the request falls back to HTTP/2.
+- **HTTP/3 is not the first protocol used.** The QUIC session is set up behind the SOCKS5 association, so the opening request or two lose the race to HTTP/2 and land on it; `quic_hints` shortens that, and a session settles onto HTTP/3 after them.
+
+Falling back is what a browser does, so none of it is an error and `Response.http_version` simply reads `"h2"`.
 For traffic that is only worth sending over HTTP/3, that silence is the danger, so it can be turned into a failure:
 
 ```python

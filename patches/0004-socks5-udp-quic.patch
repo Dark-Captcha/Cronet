@@ -1,0 +1,1180 @@
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 06f2c841805eb..a1173f486c524 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -1007,6 +1007,8 @@ component("net") {
+     "socket/socket_tag.h",
+     "socket/socks5_client_socket.cc",
+     "socket/socks5_client_socket.h",
++    "socket/socks5_udp_client_socket.cc",
++    "socket/socks5_udp_client_socket.h",
+     "socket/socks_client_socket.cc",
+     "socket/socks_client_socket.h",
+     "socket/socks_connect_job.cc",
+diff --git a/net/http/http_stream_factory_job.cc b/net/http/http_stream_factory_job.cc
+index 5b6433534e4f6..10956b6cc7561 100644
+--- a/net/http/http_stream_factory_job.cc
++++ b/net/http/http_stream_factory_job.cc
+@@ -47,6 +47,7 @@
+ #include "net/socket/client_socket_pool_manager.h"
+ #include "net/socket/connect_job.h"
+ #include "net/socket/next_proto.h"
++#include "net/socket/socks5_udp_client_socket.h"
+ #include "net/socket/ssl_client_socket.h"
+ #include "net/socket/stream_socket.h"
+ #include "net/spdy/bidirectional_stream_spdy_impl.h"
+@@ -727,9 +728,11 @@ int HttpStreamFactory::Job::DoInitConnectionImpl() {
+   DCHECK(!connection_->is_initialized());
+ 
+   if (using_quic_ && !proxy_info_.is_direct() &&
+-      !proxy_info_.proxy_chain().Last().is_quic()) {
+-    // QUIC can not be spoken to non-QUIC proxies.  This error should not be
+-    // user visible, because the non-alternative Job should be resumed.
++      !proxy_info_.proxy_chain().Last().is_quic() &&
++      !IsSocks5UdpProxyChain(proxy_info_.proxy_chain())) {
++    // QUIC reaches a QUIC proxy directly, and a SOCKS5 proxy through its UDP
++    // association. It can not be spoken to any other kind. This error should
++    // not be user visible, because the non-alternative Job should be resumed.
+     return ERR_NO_SUPPORTED_PROXIES;
+   }
+ 
+@@ -853,13 +856,15 @@ int HttpStreamFactory::Job::DoInitConnectionImplQuic() {
+ 
+   ProxyChain proxy_chain = proxy_info_.proxy_chain();
+   if (!proxy_chain.is_direct()) {
+-    // We only support proxying QUIC over QUIC. While MASQUE defines mechanisms
+-    // to carry QUIC traffic over non-QUIC proxies, the performance of these
+-    // mechanisms would be worse than simply using H/1 or H/2 to reach the
+-    // destination. The error for an invalid condition should not be user
+-    // visible, because the non-alternative Job should be resumed.
+-    if (proxy_chain.AnyProxy(
+-            [](const ProxyServer& s) { return !s.is_quic(); })) {
++    // QUIC travels over a QUIC proxy, and over a SOCKS5 proxy that relays UDP
++    // with the UDP ASSOCIATE command of RFC 1928 — see SOCKS5UDPClientSocket.
++    // MASQUE defines a further mechanism over non-QUIC proxies whose
++    // performance would be worse than simply using H/1 or H/2, and that one is
++    // still not implemented. The error for an invalid condition should not be
++    // user visible, because the non-alternative Job should be resumed.
++    const bool all_quic =
++        !proxy_chain.AnyProxy([](const ProxyServer& s) { return !s.is_quic(); });
++    if (!all_quic && !IsSocks5UdpProxyChain(proxy_chain)) {
+       return ERR_NO_SUPPORTED_PROXIES;
+     }
+   }
+diff --git a/net/quic/quic_chromium_client_session.cc b/net/quic/quic_chromium_client_session.cc
+index 8eee98823aa70..e2428663f9d90 100644
+--- a/net/quic/quic_chromium_client_session.cc
++++ b/net/quic/quic_chromium_client_session.cc
+@@ -3428,7 +3428,8 @@ void QuicChromiumClientSession::CreateContextForMultiPortPath(
+     std::unique_ptr<quic::MultiPortPathContextObserver> context_observer) {
+   // Create and configure socket on default network
+   std::unique_ptr<DatagramClientSocket> probing_socket =
+-      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source());
++      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source(),
++                                  session_key_.proxy_chain());
+   if (base::FeatureList::IsEnabled(net::features::kAsyncMultiPortPath)) {
+     DatagramClientSocket* probing_socket_ptr = probing_socket.get();
+     CompletionOnceCallback configure_callback = base::BindOnce(
+@@ -3521,7 +3522,8 @@ void QuicChromiumClientSession::StartProbing(
+ 
+   // Create and configure socket on |network|.
+   std::unique_ptr<DatagramClientSocket> probing_socket =
+-      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source());
++      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source(),
++                                  session_key_.proxy_chain());
+   DatagramClientSocket* probing_socket_ptr = probing_socket.get();
+   CompletionOnceCallback configure_callback =
+       base::BindOnce(&QuicChromiumClientSession::FinishStartProbing,
+@@ -4123,7 +4125,8 @@ void QuicChromiumClientSession::Migrate(handles::NetworkHandle network,
+ 
+   // Create and configure socket on |network|.
+   std::unique_ptr<DatagramClientSocket> socket(
+-      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source()));
++      session_pool_->CreateSocket(net_log_.net_log(), net_log_.source(),
++                                  session_key_.proxy_chain()));
+   DatagramClientSocket* socket_ptr = socket.get();
+   DVLOG(1) << "Force blocking the packet writer";
+   static_cast<QuicChromiumPacketWriter*>(connection()->writer())
+diff --git a/net/quic/quic_session_attempt.cc b/net/quic/quic_session_attempt.cc
+index ec7876cd2491e..ba5ac751775ed 100644
+--- a/net/quic/quic_session_attempt.cc
++++ b/net/quic/quic_session_attempt.cc
+@@ -19,6 +19,7 @@
+ #include "net/quic/address_utils.h"
+ #include "net/quic/quic_http_stream.h"
+ #include "net/quic/quic_session_pool.h"
++#include "net/socket/socks5_udp_client_socket.h"
+ #include "net/spdy/multiplexed_session_creation_initiator.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/quic_versions.h"
+ 
+@@ -197,7 +198,12 @@ int QuicSessionAttempt::DoCreateSession() {
+         std::move(local_endpoint_), std::move(ip_endpoint_),
+         std::move(proxy_stream_), std::move(user_agent), net_log(), network_);
+   } else {
+-    if (base::FeatureList::IsEnabled(net::features::kAsyncQuicSession)) {
++    // A SOCKS5 association cannot be established synchronously: it needs a TCP
++    // control connection, a greeting, authentication and a UDP ASSOCIATE
++    // exchange before the first datagram can be sent. So that path always
++    // takes the asynchronous branch, whatever the feature flag says.
++    if (base::FeatureList::IsEnabled(net::features::kAsyncQuicSession) ||
++        IsSocks5UdpProxyChain(key().session_key().proxy_chain())) {
+       return pool()->CreateSessionAsync(
+           base::BindOnce(&QuicSessionAttempt::OnCreateSessionComplete,
+                          weak_ptr_factory_.GetWeakPtr()),
+diff --git a/net/quic/quic_session_pool.cc b/net/quic/quic_session_pool.cc
+index 3e0cca96db01f..9691924c4633c 100644
+--- a/net/quic/quic_session_pool.cc
++++ b/net/quic/quic_session_pool.cc
+@@ -75,6 +75,7 @@
+ #include "net/socket/next_proto.h"
+ #include "net/socket/socket_performance_watcher.h"
+ #include "net/socket/socket_performance_watcher_factory.h"
++#include "net/socket/socks5_udp_client_socket.h"
+ #include "net/socket/udp_client_socket.h"
+ #include "net/spdy/multiplexed_session_creation_initiator.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h"
+@@ -953,7 +954,13 @@ int QuicSessionPool::RequestSession(
+   std::unique_ptr<Job> job;
+   // Connect start time, but only for direct connections to a proxy.
+   std::optional<base::TimeTicks> proxy_connect_start_time = std::nullopt;
+-  if (session_key.proxy_chain().is_direct()) {
++  // A SOCKS5 chain takes the direct path deliberately. ProxyJob builds a QUIC
++  // session *to* the proxy and tunnels inside it, which is how a QUIC proxy
++  // works; a SOCKS5 proxy instead relays datagrams, and CreateSocket has
++  // already wrapped the socket to do that. From here up, the connection is an
++  // ordinary direct one.
++  if (session_key.proxy_chain().is_direct() ||
++      IsSocks5UdpProxyChain(session_key.proxy_chain())) {
+     if (session_key.session_usage() == SessionUsage::kProxy) {
+       proxy_connect_start_time = base::TimeTicks::Now();
+     }
+@@ -1384,13 +1391,49 @@ handles::NetworkHandle QuicSessionPool::FindAlternateNetwork(
+ 
+ std::unique_ptr<DatagramClientSocket> QuicSessionPool::CreateSocket(
+     NetLog* net_log,
+-    const NetLogSource& source) {
++    const NetLogSource& source,
++    const ProxyChain& proxy_chain) {
+   auto socket = client_socket_factory_->CreateDatagramClientSocket(
+       DatagramSocket::DEFAULT_BIND, net_log, source);
+   if (params_.enable_socket_recv_optimization) {
+     socket->EnableRecvOptimization();
+   }
+-  return socket;
++  if (!IsSocks5UdpProxyChain(proxy_chain)) {
++    return socket;
++  }
++  // Datagrams go to the proxy's relay instead, each carrying a header naming
++  // the destination. Everything above this sees an ordinary connected socket.
++  static constexpr NetworkTrafficAnnotationTag kSocks5UdpAnnotation =
++      DefineNetworkTrafficAnnotation("socks5_udp_associate", R"(
++        semantics {
++          sender: "QUIC Session Pool"
++          description:
++            "Establishes a SOCKS5 UDP association so that a QUIC connection "
++            "can be carried through a SOCKS5 proxy. Sends the SOCKS5 "
++            "greeting, optional username and password, and the UDP ASSOCIATE "
++            "command over a TCP control connection to the proxy."
++          trigger:
++            "A QUIC connection is attempted while a SOCKS5 proxy is "
++            "configured for the request."
++          data:
++            "The SOCKS5 handshake, including proxy credentials if the "
++            "configuration supplies them."
++          destination: OTHER
++          destination_other: "The SOCKS5 proxy named by the proxy settings."
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "Controlled by the proxy configuration."
++          policy_exception_justification:
++            "Governed by the existing proxy settings policies."
++        })");
++
++  const ProxyServer& proxy = proxy_chain.Last();
++  return std::make_unique<SOCKS5UDPClientSocket>(
++      std::move(socket), client_socket_factory_, host_resolver_,
++      proxy.host_port_pair(), proxy.username(), proxy.password(),
++      kSocks5UdpAnnotation,
++      NetLogWithSource::Make(net_log, NetLogSourceType::SOCKET));
+ }
+ 
+ void QuicSessionPool::OnIPAddressChanged(
+@@ -1837,7 +1880,8 @@ int QuicSessionPool::CreateSessionSync(
+   // TODO(crbug.com/40256842): This logic only knows how to try one IP
+   // endpoint.
+   std::unique_ptr<DatagramClientSocket> socket(
+-      CreateSocket(net_log.net_log(), net_log.source()));
++      CreateSocket(net_log.net_log(), net_log.source(),
++                   key.session_key().proxy_chain()));
+ 
+   // If migrate_sessions_on_network_change_v2 is on, passing in
+   // handles::kInvalidNetworkHandle will bind the socket to the default network.
+@@ -1881,7 +1925,8 @@ int QuicSessionPool::CreateSessionAsync(
+   // TODO(crbug.com/40256842): This logic only knows how to try one IP
+   // endpoint.
+   std::unique_ptr<DatagramClientSocket> socket(
+-      CreateSocket(net_log.net_log(), net_log.source()));
++      CreateSocket(net_log.net_log(), net_log.source(),
++                   key.session_key().proxy_chain()));
+   DatagramClientSocket* socket_ptr = socket.get();
+   CompletionOnceCallback connect_and_configure_callback = base::BindOnce(
+       &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
+diff --git a/net/quic/quic_session_pool.h b/net/quic/quic_session_pool.h
+index a580bf6eaf4fd..d166f2f5450fb 100644
+--- a/net/quic/quic_session_pool.h
++++ b/net/quic/quic_session_pool.h
+@@ -474,10 +474,13 @@ class NET_EXPORT_PRIVATE QuicSessionPool
+       handles::NetworkHandle old_network);
+ 
+   // Creates a datagram socket. |source| is the NetLogSource for the entity
+-  // trying to create the socket, if it has one.
++  // trying to create the socket, if it has one. When |proxy_chain| names a
++  // SOCKS5 proxy, the socket relays its datagrams through that proxy's UDP
++  // association instead of sending them directly.
+   std::unique_ptr<DatagramClientSocket> CreateSocket(
+       NetLog* net_log,
+-      const NetLogSource& source);
++      const NetLogSource& source,
++      const ProxyChain& proxy_chain);
+ 
+   // NetworkChangeNotifier::IPAddressObserver methods:
+ 
+diff --git a/net/socket/socks5_udp_client_socket.cc b/net/socket/socks5_udp_client_socket.cc
+new file mode 100644
+index 0000000000000..ca555d263fa11
+--- /dev/null
++++ b/net/socket/socks5_udp_client_socket.cc
+@@ -0,0 +1,728 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "net/socket/socks5_udp_client_socket.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/numerics/safe_conversions.h"
++#include "net/base/address_list.h"
++#include "net/base/io_buffer.h"
++#include "net/base/ip_address.h"
++#include "net/base/net_errors.h"
++#include "net/base/proxy_chain.h"
++#include "net/socket/client_socket_factory.h"
++#include "net/socket/stream_socket.h"
++
++namespace net {
++
++namespace {
++
++constexpr uint8_t kSOCKS5Version = 0x05;
++constexpr uint8_t kAuthMethodNone = 0x00;
++constexpr uint8_t kAuthMethodUsernamePassword = 0x02;
++constexpr uint8_t kAuthSubnegotiationVersion = 0x01;
++constexpr uint8_t kUdpAssociateCommand = 0x03;
++constexpr uint8_t kAddressTypeIPv4 = 0x01;
++constexpr uint8_t kAddressTypeDomain = 0x03;
++constexpr uint8_t kAddressTypeIPv6 = 0x04;
++
++// Version, method.
++constexpr int kGreetReplySize = 2;
++// Version, status.
++constexpr int kAuthReplySize = 2;
++// Version, reply, reserved, address type. The address and port follow, and
++// their length depends on the address type.
++constexpr int kReplyPrefixSize = 4;
++
++// RFC 1928 section 7: two reserved bytes, a fragment byte, an address type,
++// the address, then the port.
++constexpr size_t kUdpHeaderSizeIPv4 = 2 + 1 + 1 + 4 + 2;
++constexpr size_t kUdpHeaderSizeIPv6 = 2 + 1 + 1 + 16 + 2;
++
++size_t UdpHeaderSize(const IPEndPoint& endpoint) {
++  return endpoint.address().IsIPv4() ? kUdpHeaderSizeIPv4 : kUdpHeaderSizeIPv6;
++}
++
++// Writes the RFC 1928 section 7 request header naming |destination|.
++void WriteUdpHeader(const IPEndPoint& destination, base::span<uint8_t> out) {
++  out[0] = 0x00;
++  out[1] = 0x00;
++  out[2] = 0x00;  // FRAG: this implementation never fragments.
++  const bool is_ipv4 = destination.address().IsIPv4();
++  out[3] = is_ipv4 ? kAddressTypeIPv4 : kAddressTypeIPv6;
++  const auto& bytes = destination.address().bytes();
++  out.subspan(4u, bytes.size()).copy_from(bytes);
++  auto port = base::U16ToBigEndian(destination.port());
++  out.subspan(4u + bytes.size(), port.size()).copy_from(port);
++}
++
++// The offset at which a relayed datagram's payload begins, or 0 if the header
++// is malformed.
++size_t UdpPayloadOffset(base::span<const uint8_t> datagram) {
++  if (datagram.size() < 4) {
++    return 0;
++  }
++  switch (datagram[3]) {
++    case kAddressTypeIPv4:
++      return datagram.size() >= kUdpHeaderSizeIPv4 ? kUdpHeaderSizeIPv4 : 0;
++    case kAddressTypeIPv6:
++      return datagram.size() >= kUdpHeaderSizeIPv6 ? kUdpHeaderSizeIPv6 : 0;
++    case kAddressTypeDomain: {
++      const size_t length = 5u + datagram[4] + 2u;
++      return datagram.size() >= length ? length : 0;
++    }
++    default:
++      return 0;
++  }
++}
++
++}  // namespace
++
++bool IsSocks5UdpProxyChain(const ProxyChain& proxy_chain) {
++  // An association is between one client and one proxy, so a chain of more
++  // than one hop cannot carry it.
++  return !proxy_chain.is_direct() && proxy_chain.length() == 1u &&
++         proxy_chain.Last().scheme() == ProxyServer::SCHEME_SOCKS5;
++}
++
++SOCKS5UDPClientSocket::SOCKS5UDPClientSocket(
++    std::unique_ptr<DatagramClientSocket> udp_socket,
++    ClientSocketFactory* client_socket_factory,
++    HostResolver* host_resolver,
++    const HostPortPair& proxy,
++    std::string username,
++    std::string password,
++    const NetworkTrafficAnnotationTag& traffic_annotation,
++    NetLogWithSource net_log)
++    : udp_socket_(std::move(udp_socket)),
++      client_socket_factory_(client_socket_factory),
++      host_resolver_(host_resolver),
++      proxy_(proxy),
++      username_(std::move(username)),
++      password_(std::move(password)),
++      traffic_annotation_(traffic_annotation),
++      net_log_(std::move(net_log)) {}
++
++SOCKS5UDPClientSocket::~SOCKS5UDPClientSocket() {
++  Close();
++}
++
++int SOCKS5UDPClientSocket::Connect(const IPEndPoint& address) {
++  // The association needs several round trips, so there is no synchronous
++  // path. Callers reach this socket through ConnectAsync.
++  return ERR_NOT_IMPLEMENTED;
++}
++
++int SOCKS5UDPClientSocket::ConnectUsingNetwork(handles::NetworkHandle network,
++                                               const IPEndPoint& address) {
++  return ERR_NOT_IMPLEMENTED;
++}
++
++int SOCKS5UDPClientSocket::ConnectUsingDefaultNetwork(
++    const IPEndPoint& address) {
++  return ERR_NOT_IMPLEMENTED;
++}
++
++int SOCKS5UDPClientSocket::ConnectAsync(const IPEndPoint& address,
++                                        CompletionOnceCallback callback) {
++  DCHECK_EQ(STATE_NONE, next_state_);
++  destination_ = address;
++  next_state_ = STATE_RESOLVE_PROXY;
++  int rv = DoLoop(OK);
++  if (rv == ERR_IO_PENDING) {
++    user_callback_ = std::move(callback);
++  }
++  return rv;
++}
++
++int SOCKS5UDPClientSocket::ConnectUsingNetworkAsync(
++    handles::NetworkHandle network,
++    const IPEndPoint& address,
++    CompletionOnceCallback callback) {
++  // Binding the association to one network would have to bind both sockets,
++  // and the control connection's network is the proxy's business.
++  return ConnectAsync(address, std::move(callback));
++}
++
++int SOCKS5UDPClientSocket::ConnectUsingDefaultNetworkAsync(
++    const IPEndPoint& address,
++    CompletionOnceCallback callback) {
++  return ConnectAsync(address, std::move(callback));
++}
++
++void SOCKS5UDPClientSocket::DoCallback(int result) {
++  DCHECK_NE(ERR_IO_PENDING, result);
++  if (!user_callback_.is_null()) {
++    std::move(user_callback_).Run(result);
++  }
++}
++
++void SOCKS5UDPClientSocket::OnIOComplete(int result) {
++  int rv = DoLoop(result);
++  if (rv != ERR_IO_PENDING) {
++    DoCallback(rv);
++  }
++}
++
++int SOCKS5UDPClientSocket::DoLoop(int last_io_result) {
++  DCHECK_NE(next_state_, STATE_NONE);
++  int rv = last_io_result;
++  do {
++    State state = next_state_;
++    next_state_ = STATE_NONE;
++    switch (state) {
++      case STATE_RESOLVE_PROXY:
++        rv = DoResolveProxy();
++        break;
++      case STATE_RESOLVE_PROXY_COMPLETE:
++        rv = DoResolveProxyComplete(rv);
++        break;
++      case STATE_TCP_CONNECT:
++        rv = DoTcpConnect();
++        break;
++      case STATE_TCP_CONNECT_COMPLETE:
++        rv = DoTcpConnectComplete(rv);
++        break;
++      case STATE_GREET_WRITE:
++        rv = DoGreetWrite();
++        break;
++      case STATE_GREET_WRITE_COMPLETE:
++        rv = DoGreetWriteComplete(rv);
++        break;
++      case STATE_GREET_READ:
++        rv = DoGreetRead();
++        break;
++      case STATE_GREET_READ_COMPLETE:
++        rv = DoGreetReadComplete(rv);
++        break;
++      case STATE_AUTH_WRITE:
++        rv = DoAuthWrite();
++        break;
++      case STATE_AUTH_WRITE_COMPLETE:
++        rv = DoAuthWriteComplete(rv);
++        break;
++      case STATE_AUTH_READ:
++        rv = DoAuthRead();
++        break;
++      case STATE_AUTH_READ_COMPLETE:
++        rv = DoAuthReadComplete(rv);
++        break;
++      case STATE_ASSOCIATE_WRITE:
++        rv = DoAssociateWrite();
++        break;
++      case STATE_ASSOCIATE_WRITE_COMPLETE:
++        rv = DoAssociateWriteComplete(rv);
++        break;
++      case STATE_ASSOCIATE_READ:
++        rv = DoAssociateRead();
++        break;
++      case STATE_ASSOCIATE_READ_COMPLETE:
++        rv = DoAssociateReadComplete(rv);
++        break;
++      case STATE_UDP_CONNECT:
++        rv = DoUdpConnect();
++        break;
++      default:
++        NOTREACHED() << "bad state";
++    }
++  } while (rv != ERR_IO_PENDING && next_state_ != STATE_NONE);
++  return rv;
++}
++
++int SOCKS5UDPClientSocket::DoResolveProxy() {
++  next_state_ = STATE_RESOLVE_PROXY_COMPLETE;
++
++  // A numeric proxy needs no resolver, and configurations that name one by
++  // address are common enough to be worth the short cut.
++  IPAddress literal;
++  if (literal.AssignFromIPLiteral(proxy_.host())) {
++    proxy_addresses_ = AddressList(IPEndPoint(literal, proxy_.port()));
++    return OK;
++  }
++
++  HostResolver::ResolveHostParameters parameters;
++  parameters.initial_priority = MEDIUM;
++  resolve_request_ = host_resolver_->CreateRequest(
++      HostPortPair(proxy_.host(), proxy_.port()), NetworkAnonymizationKey(),
++      net_log_, parameters);
++  return resolve_request_->Start(base::BindOnce(
++      &SOCKS5UDPClientSocket::OnIOComplete, weak_factory_.GetWeakPtr()));
++}
++
++int SOCKS5UDPClientSocket::DoResolveProxyComplete(int result) {
++  if (result != OK) {
++    return result;
++  }
++  if (resolve_request_) {
++    const AddressList& resolved = resolve_request_->GetAddressResults();
++    if (resolved.empty()) {
++      return ERR_NAME_NOT_RESOLVED;
++    }
++    proxy_addresses_ = resolved;
++    resolve_request_.reset();
++  }
++  next_state_ = STATE_TCP_CONNECT;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoTcpConnect() {
++  next_state_ = STATE_TCP_CONNECT_COMPLETE;
++  control_socket_ = client_socket_factory_->CreateTransportClientSocket(
++      proxy_addresses_, nullptr, nullptr, net_log_.net_log(),
++      net_log_.source());
++  return control_socket_->Connect(base::BindOnce(
++      &SOCKS5UDPClientSocket::OnIOComplete, weak_factory_.GetWeakPtr()));
++}
++
++int SOCKS5UDPClientSocket::DoTcpConnectComplete(int result) {
++  if (result != OK) {
++    return result;
++  }
++  next_state_ = STATE_GREET_WRITE;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoGreetWrite() {
++  next_state_ = STATE_GREET_WRITE_COMPLETE;
++  if (!write_buf_) {
++    std::vector<uint8_t> greeting;
++    if (has_credentials()) {
++      greeting = {kSOCKS5Version, 0x02, kAuthMethodNone,
++                  kAuthMethodUsernamePassword};
++    } else {
++      greeting = {kSOCKS5Version, 0x01, kAuthMethodNone};
++    }
++    auto buffer = base::MakeRefCounted<VectorIOBuffer>(std::move(greeting));
++    write_buf_ = base::MakeRefCounted<DrainableIOBuffer>(std::move(buffer),
++                                                         buffer->size());
++  }
++  return control_socket_->Write(
++      write_buf_.get(), write_buf_->BytesRemaining(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()),
++      traffic_annotation_);
++}
++
++int SOCKS5UDPClientSocket::DoGreetWriteComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  write_buf_->DidConsume(result);
++  if (write_buf_->BytesRemaining() == 0) {
++    write_buf_.reset();
++    next_state_ = STATE_GREET_READ;
++  } else {
++    next_state_ = STATE_GREET_WRITE;
++  }
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoGreetRead() {
++  next_state_ = STATE_GREET_READ_COMPLETE;
++  if (!read_buf_) {
++    read_buf_ = base::MakeRefCounted<GrowableIOBuffer>();
++    read_buf_->SetCapacity(kGreetReplySize);
++  }
++  return control_socket_->Read(
++      read_buf_.get(), read_buf_->RemainingCapacity(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()));
++}
++
++int SOCKS5UDPClientSocket::DoGreetReadComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  if (result == 0) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  read_buf_->set_offset(read_buf_->offset() + result);
++  if (read_buf_->RemainingCapacity() > 0) {
++    next_state_ = STATE_GREET_READ;
++    return OK;
++  }
++  base::span<uint8_t> reply = read_buf_->span_before_offset();
++  if (reply[0] != kSOCKS5Version) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  const uint8_t method = reply[1];
++  read_buf_.reset();
++  if (method == kAuthMethodUsernamePassword && has_credentials()) {
++    next_state_ = STATE_AUTH_WRITE;
++    return OK;
++  }
++  if (method != kAuthMethodNone) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  next_state_ = STATE_ASSOCIATE_WRITE;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoAuthWrite() {
++  next_state_ = STATE_AUTH_WRITE_COMPLETE;
++  if (!write_buf_) {
++    std::vector<uint8_t> request;
++    request.reserve(3 + username_.size() + password_.size());
++    request.push_back(kAuthSubnegotiationVersion);
++    request.push_back(base::checked_cast<uint8_t>(username_.size()));
++    request.insert(request.end(), username_.begin(), username_.end());
++    request.push_back(base::checked_cast<uint8_t>(password_.size()));
++    request.insert(request.end(), password_.begin(), password_.end());
++    auto buffer = base::MakeRefCounted<VectorIOBuffer>(std::move(request));
++    write_buf_ = base::MakeRefCounted<DrainableIOBuffer>(std::move(buffer),
++                                                         buffer->size());
++  }
++  return control_socket_->Write(
++      write_buf_.get(), write_buf_->BytesRemaining(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()),
++      traffic_annotation_);
++}
++
++int SOCKS5UDPClientSocket::DoAuthWriteComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  write_buf_->DidConsume(result);
++  if (write_buf_->BytesRemaining() == 0) {
++    write_buf_.reset();
++    next_state_ = STATE_AUTH_READ;
++  } else {
++    next_state_ = STATE_AUTH_WRITE;
++  }
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoAuthRead() {
++  next_state_ = STATE_AUTH_READ_COMPLETE;
++  if (!read_buf_) {
++    read_buf_ = base::MakeRefCounted<GrowableIOBuffer>();
++    read_buf_->SetCapacity(kAuthReplySize);
++  }
++  return control_socket_->Read(
++      read_buf_.get(), read_buf_->RemainingCapacity(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()));
++}
++
++int SOCKS5UDPClientSocket::DoAuthReadComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  if (result == 0) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  read_buf_->set_offset(read_buf_->offset() + result);
++  if (read_buf_->RemainingCapacity() > 0) {
++    next_state_ = STATE_AUTH_READ;
++    return OK;
++  }
++  base::span<uint8_t> reply = read_buf_->span_before_offset();
++  read_buf_.reset();
++  if (reply[0] != kAuthSubnegotiationVersion) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  if (reply[1] != 0x00) {
++    return ERR_PROXY_AUTH_UNSUPPORTED;
++  }
++  next_state_ = STATE_ASSOCIATE_WRITE;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoAssociateWrite() {
++  next_state_ = STATE_ASSOCIATE_WRITE_COMPLETE;
++  if (!write_buf_) {
++    // All-zero address and port: the client does not know in advance which
++    // local endpoint it will send from, which is the usual case and what the
++    // RFC provides for.
++    std::vector<uint8_t> request = {kSOCKS5Version, kUdpAssociateCommand, 0x00,
++                                    kAddressTypeIPv4, 0,    0,    0,    0,
++                                    0,                0};
++    auto buffer = base::MakeRefCounted<VectorIOBuffer>(std::move(request));
++    write_buf_ = base::MakeRefCounted<DrainableIOBuffer>(std::move(buffer),
++                                                         buffer->size());
++  }
++  return control_socket_->Write(
++      write_buf_.get(), write_buf_->BytesRemaining(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()),
++      traffic_annotation_);
++}
++
++int SOCKS5UDPClientSocket::DoAssociateWriteComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  write_buf_->DidConsume(result);
++  if (write_buf_->BytesRemaining() == 0) {
++    write_buf_.reset();
++    next_state_ = STATE_ASSOCIATE_READ;
++    associate_reply_remaining_ = 0;
++  } else {
++    next_state_ = STATE_ASSOCIATE_WRITE;
++  }
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoAssociateRead() {
++  next_state_ = STATE_ASSOCIATE_READ_COMPLETE;
++  if (!read_buf_) {
++    read_buf_ = base::MakeRefCounted<GrowableIOBuffer>();
++    read_buf_->SetCapacity(kReplyPrefixSize);
++  }
++  return control_socket_->Read(
++      read_buf_.get(), read_buf_->RemainingCapacity(),
++      base::BindOnce(&SOCKS5UDPClientSocket::OnIOComplete,
++                     weak_factory_.GetWeakPtr()));
++}
++
++int SOCKS5UDPClientSocket::DoAssociateReadComplete(int result) {
++  if (result < 0) {
++    return result;
++  }
++  if (result == 0) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++  read_buf_->set_offset(read_buf_->offset() + result);
++  if (read_buf_->RemainingCapacity() > 0) {
++    next_state_ = STATE_ASSOCIATE_READ;
++    return OK;
++  }
++
++  base::span<uint8_t> reply = read_buf_->span_before_offset();
++  if (associate_reply_remaining_ == 0) {
++    // The fixed prefix has arrived; work out how much address follows.
++    if (reply[0] != kSOCKS5Version) {
++      return ERR_SOCKS_CONNECTION_FAILED;
++    }
++    if (reply[1] != 0x00) {
++      // The proxy declined to relay UDP. 0x07 is "command not supported",
++      // which is what a proxy without UDP support answers.
++      return ERR_SOCKS_CONNECTION_FAILED;
++    }
++    switch (reply[3]) {
++      case kAddressTypeIPv4:
++        associate_reply_remaining_ = 4 + 2;
++        break;
++      case kAddressTypeIPv6:
++        associate_reply_remaining_ = 16 + 2;
++        break;
++      default:
++        // A named relay would need resolving, which the proxy should not ask
++        // of a client it just told where to send.
++        return ERR_SOCKS_CONNECTION_FAILED;
++    }
++    read_buf_->SetCapacity(kReplyPrefixSize +
++                           base::checked_cast<int>(associate_reply_remaining_));
++    next_state_ = STATE_ASSOCIATE_READ;
++    return OK;
++  }
++
++  // The whole reply is in hand.
++  const uint8_t address_type = reply[3];
++  base::span<uint8_t> rest = reply.subspan(static_cast<size_t>(kReplyPrefixSize));
++  IPAddress relay_address;
++  size_t address_length = 0;
++  if (address_type == kAddressTypeIPv4) {
++    address_length = 4;
++    relay_address = IPAddress(rest.first(4u));
++  } else {
++    address_length = 16;
++    relay_address = IPAddress(rest.first(16u));
++  }
++  const uint16_t port =
++      base::U16FromBigEndian(rest.subspan(address_length).first<2>());
++
++  // A proxy that answers with an unspecified address means "the one you are
++  // already talking to", which is the address of the control connection.
++  if (relay_address.IsZero()) {
++    IPEndPoint peer;
++    int rv = control_socket_->GetPeerAddress(&peer);
++    if (rv != OK) {
++      return rv;
++    }
++    relay_address = peer.address();
++  }
++  relay_ = IPEndPoint(relay_address, port);
++  read_buf_.reset();
++  next_state_ = STATE_UDP_CONNECT;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::DoUdpConnect() {
++  // Connected to the relay, not to the destination: every datagram names the
++  // destination in its own header instead.
++  return udp_socket_->Connect(relay_);
++}
++
++int SOCKS5UDPClientSocket::Write(
++    IOBuffer* buf,
++    int buf_len,
++    CompletionOnceCallback callback,
++    const NetworkTrafficAnnotationTag& traffic_annotation) {
++  const size_t header_size = UdpHeaderSize(destination_);
++  auto wrapped = base::MakeRefCounted<IOBufferWithSize>(
++      base::checked_cast<int>(header_size) + buf_len);
++  WriteUdpHeader(destination_, wrapped->span());
++  wrapped->span().subspan(header_size).copy_from(
++      buf->span().first(base::checked_cast<size_t>(buf_len)));
++
++  // The caller counts the payload it handed over, not the bytes on the wire,
++  // so the header is subtracted from the result. A datagram write is
++  // all-or-nothing, so anything shorter than the whole thing is a failure
++  // rather than a partial success — reporting it as a byte count would hand
++  // back a negative number, which the caller would read as an error code.
++  const auto to_payload_length = [](int result, size_t header_size) -> int {
++    if (result < 0) {
++      return result;
++    }
++    if (result < base::checked_cast<int>(header_size)) {
++      return ERR_FAILED;
++    }
++    return result - base::checked_cast<int>(header_size);
++  };
++
++  int rv = udp_socket_->Write(
++      wrapped.get(), wrapped->size(),
++      base::BindOnce(
++          // `wrapped` rides along only to stay alive until the write lands.
++          [](scoped_refptr<IOBuffer> wrapped, size_t header_size,
++             decltype(to_payload_length) to_payload_length,
++             CompletionOnceCallback callback, int result) {
++            std::move(callback).Run(to_payload_length(result, header_size));
++          },
++          wrapped, header_size, to_payload_length, std::move(callback)),
++      traffic_annotation);
++  return rv == ERR_IO_PENDING ? rv : to_payload_length(rv, header_size);
++}
++
++int SOCKS5UDPClientSocket::Read(IOBuffer* buf,
++                                int buf_len,
++                                CompletionOnceCallback callback) {
++  // A relayed datagram is the caller's payload behind a header, so the read
++  // lands in a buffer of its own and is copied across once the header has been
++  // measured. The largest header RFC 1928 defines is the IPv6 one, so that is
++  // what the extra room allows for.
++  //
++  // Both buffers travel with the completion rather than living on the object:
++  // two reads in flight at once would otherwise share one pair of members, and
++  // the first to complete would unwrap into the second's buffer.
++  const int wrapped_len =
++      buf_len + base::checked_cast<int>(kUdpHeaderSizeIPv6);
++  auto wrapped = base::MakeRefCounted<IOBufferWithSize>(wrapped_len);
++  scoped_refptr<IOBuffer> user_buf(buf);
++
++  const auto unwrap = [](const scoped_refptr<IOBuffer>& wrapped,
++                         const scoped_refptr<IOBuffer>& user_buf,
++                         int user_buf_len, int result) -> int {
++    if (result <= 0) {
++      return result;
++    }
++    base::span<const uint8_t> datagram =
++        wrapped->span().first(base::checked_cast<size_t>(result));
++    const size_t offset = UdpPayloadOffset(datagram);
++    if (offset == 0) {
++      // A datagram the proxy sent that this cannot parse. Dropping it silently
++      // would look like a stalled connection, so it is reported.
++      return ERR_SOCKS_CONNECTION_FAILED;
++    }
++    base::span<const uint8_t> payload = datagram.subspan(offset);
++    if (payload.size() > base::checked_cast<size_t>(user_buf_len)) {
++      return ERR_MSG_TOO_BIG;
++    }
++    user_buf->span().first(payload.size()).copy_from(payload);
++    return base::checked_cast<int>(payload.size());
++  };
++
++  int rv = udp_socket_->Read(
++      wrapped.get(), wrapped_len,
++      base::BindOnce(
++          [](scoped_refptr<IOBuffer> wrapped, scoped_refptr<IOBuffer> user_buf,
++             int user_buf_len, decltype(unwrap) unwrap,
++             CompletionOnceCallback callback, int result) {
++            std::move(callback).Run(
++                unwrap(wrapped, user_buf, user_buf_len, result));
++          },
++          wrapped, user_buf, buf_len, unwrap, std::move(callback)));
++  if (rv == ERR_IO_PENDING) {
++    return rv;
++  }
++  return unwrap(wrapped, user_buf, buf_len, rv);
++}
++
++void SOCKS5UDPClientSocket::Close() {
++  if (control_socket_) {
++    control_socket_->Disconnect();
++    control_socket_.reset();
++  }
++  udp_socket_->Close();
++}
++
++int SOCKS5UDPClientSocket::GetPeerAddress(IPEndPoint* address) const {
++  // The layer above asked for the destination it named, not for the relay.
++  *address = destination_;
++  return OK;
++}
++
++int SOCKS5UDPClientSocket::GetLocalAddress(IPEndPoint* address) const {
++  return udp_socket_->GetLocalAddress(address);
++}
++
++handles::NetworkHandle SOCKS5UDPClientSocket::GetBoundNetwork() const {
++  return udp_socket_->GetBoundNetwork();
++}
++
++void SOCKS5UDPClientSocket::ApplySocketTag(const SocketTag& tag) {
++  udp_socket_->ApplySocketTag(tag);
++}
++
++int SOCKS5UDPClientSocket::SetMulticastInterface(uint32_t interface_index) {
++  return udp_socket_->SetMulticastInterface(interface_index);
++}
++
++void SOCKS5UDPClientSocket::EnableRecvOptimization() {
++  udp_socket_->EnableRecvOptimization();
++}
++
++int SOCKS5UDPClientSocket::SetReceiveBufferSize(int32_t size) {
++  return udp_socket_->SetReceiveBufferSize(size);
++}
++
++int SOCKS5UDPClientSocket::SetSendBufferSize(int32_t size) {
++  return udp_socket_->SetSendBufferSize(size);
++}
++
++void SOCKS5UDPClientSocket::UseNonBlockingIO() {
++  udp_socket_->UseNonBlockingIO();
++}
++
++int SOCKS5UDPClientSocket::SetDoNotFragment() {
++  return udp_socket_->SetDoNotFragment();
++}
++
++int SOCKS5UDPClientSocket::SetRecvTos() {
++  return udp_socket_->SetRecvTos();
++}
++
++int SOCKS5UDPClientSocket::SetTos(DiffServCodePoint dscp, EcnCodePoint ecn) {
++  return udp_socket_->SetTos(dscp, ecn);
++}
++
++void SOCKS5UDPClientSocket::SetMsgConfirm(bool confirm) {
++  udp_socket_->SetMsgConfirm(confirm);
++}
++
++const NetLogWithSource& SOCKS5UDPClientSocket::NetLog() const {
++  return net_log_;
++}
++
++DscpAndEcn SOCKS5UDPClientSocket::GetLastTos() const {
++  return udp_socket_->GetLastTos();
++}
++
++}  // namespace net
+diff --git a/net/socket/socks5_udp_client_socket.h b/net/socket/socks5_udp_client_socket.h
+new file mode 100644
+index 0000000000000..d1b7e95b82bad
+--- /dev/null
++++ b/net/socket/socks5_udp_client_socket.h
+@@ -0,0 +1,198 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef NET_SOCKET_SOCKS5_UDP_CLIENT_SOCKET_H_
++#define NET_SOCKET_SOCKS5_UDP_CLIENT_SOCKET_H_
++
++#include <stdint.h>
++
++#include <memory>
++#include <string>
++
++#include "net/base/address_list.h"
++#include "net/base/completion_once_callback.h"
++#include "net/base/host_port_pair.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/net_export.h"
++#include "net/dns/host_resolver.h"
++#include "net/log/net_log_with_source.h"
++#include "net/socket/datagram_client_socket.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++
++namespace net {
++
++class ClientSocketFactory;
++class DrainableIOBuffer;
++class GrowableIOBuffer;
++class IOBuffer;
++class ProxyChain;
++class StreamSocket;
++
++// Whether |proxy_chain| can carry QUIC through a SOCKS5 UDP association.
++//
++// Defined here so that the decision has one home: the QUIC session pool asks
++// it to decide whether to wrap its socket, and the stream factory asks it to
++// decide whether a QUIC job is worth starting at all. Two copies of that rule
++// would eventually disagree, and the failure would be a silent fallback to
++// HTTP/2 rather than anything that announces itself.
++NET_EXPORT_PRIVATE bool IsSocks5UdpProxyChain(const ProxyChain& proxy_chain);
++
++// Relays datagrams through a SOCKS5 proxy using the UDP ASSOCIATE command of
++// RFC 1928, so that QUIC — and therefore HTTP/3 — can traverse a SOCKS5 proxy.
++//
++// The association is two sockets working together. A TCP control connection
++// performs the greeting, the optional RFC 1929 authentication and the
++// UDP ASSOCIATE request, and the proxy answers with the address of a relay.
++// Datagrams then travel over a separate UDP socket to that relay, each one
++// carrying the request header of RFC 1928 section 7 naming the real
++// destination. The control connection is held open for the lifetime of the
++// association, because a proxy tears the relay down when it closes.
++//
++// To the layer above this is an ordinary DatagramClientSocket connected to the
++// destination: the encapsulation is added on write and removed on read, so
++// QUIC neither knows nor needs to know that a proxy is in the path.
++class NET_EXPORT_PRIVATE SOCKS5UDPClientSocket : public DatagramClientSocket {
++ public:
++  // |udp_socket| carries the datagrams and must not be connected yet.
++  // |proxy| is the SOCKS5 proxy, and |username| and |password| are its RFC 1929
++  // credentials, empty when it needs none.
++  SOCKS5UDPClientSocket(std::unique_ptr<DatagramClientSocket> udp_socket,
++                        ClientSocketFactory* client_socket_factory,
++                        HostResolver* host_resolver,
++                        const HostPortPair& proxy,
++                        std::string username,
++                        std::string password,
++                        const NetworkTrafficAnnotationTag& traffic_annotation,
++                        NetLogWithSource net_log);
++
++  SOCKS5UDPClientSocket(const SOCKS5UDPClientSocket&) = delete;
++  SOCKS5UDPClientSocket& operator=(const SOCKS5UDPClientSocket&) = delete;
++
++  ~SOCKS5UDPClientSocket() override;
++
++  // DatagramClientSocket implementation. Only the asynchronous Connect forms
++  // are supported: the association needs several round trips with the proxy,
++  // which cannot be completed inside a synchronous call.
++  int Connect(const IPEndPoint& address) override;
++  int ConnectUsingNetwork(handles::NetworkHandle network,
++                          const IPEndPoint& address) override;
++  int ConnectUsingDefaultNetwork(const IPEndPoint& address) override;
++  int ConnectAsync(const IPEndPoint& address,
++                   CompletionOnceCallback callback) override;
++  int ConnectUsingNetworkAsync(handles::NetworkHandle network,
++                               const IPEndPoint& address,
++                               CompletionOnceCallback callback) override;
++  int ConnectUsingDefaultNetworkAsync(const IPEndPoint& address,
++                                      CompletionOnceCallback callback) override;
++
++  handles::NetworkHandle GetBoundNetwork() const override;
++  void ApplySocketTag(const SocketTag& tag) override;
++  int SetMulticastInterface(uint32_t interface_index) override;
++  void EnableRecvOptimization() override;
++
++  // Socket implementation.
++  int Read(IOBuffer* buf,
++           int buf_len,
++           CompletionOnceCallback callback) override;
++  int Write(IOBuffer* buf,
++            int buf_len,
++            CompletionOnceCallback callback,
++            const NetworkTrafficAnnotationTag& traffic_annotation) override;
++  int SetReceiveBufferSize(int32_t size) override;
++  int SetSendBufferSize(int32_t size) override;
++
++  // DatagramSocket implementation.
++  void Close() override;
++  int GetPeerAddress(IPEndPoint* address) const override;
++  int GetLocalAddress(IPEndPoint* address) const override;
++  void UseNonBlockingIO() override;
++  int SetDoNotFragment() override;
++  int SetRecvTos() override;
++  int SetTos(DiffServCodePoint dscp, EcnCodePoint ecn) override;
++  void SetMsgConfirm(bool confirm) override;
++  const NetLogWithSource& NetLog() const override;
++  DscpAndEcn GetLastTos() const override;
++
++ private:
++  enum State {
++    STATE_RESOLVE_PROXY,
++    STATE_RESOLVE_PROXY_COMPLETE,
++    STATE_TCP_CONNECT,
++    STATE_TCP_CONNECT_COMPLETE,
++    STATE_GREET_WRITE,
++    STATE_GREET_WRITE_COMPLETE,
++    STATE_GREET_READ,
++    STATE_GREET_READ_COMPLETE,
++    STATE_AUTH_WRITE,
++    STATE_AUTH_WRITE_COMPLETE,
++    STATE_AUTH_READ,
++    STATE_AUTH_READ_COMPLETE,
++    STATE_ASSOCIATE_WRITE,
++    STATE_ASSOCIATE_WRITE_COMPLETE,
++    STATE_ASSOCIATE_READ,
++    STATE_ASSOCIATE_READ_COMPLETE,
++    STATE_UDP_CONNECT,
++    STATE_NONE,
++  };
++
++  void DoCallback(int result);
++  void OnIOComplete(int result);
++  int DoLoop(int last_io_result);
++
++  int DoResolveProxy();
++  int DoResolveProxyComplete(int result);
++  int DoTcpConnect();
++  int DoTcpConnectComplete(int result);
++  int DoGreetWrite();
++  int DoGreetWriteComplete(int result);
++  int DoGreetRead();
++  int DoGreetReadComplete(int result);
++  int DoAuthWrite();
++  int DoAuthWriteComplete(int result);
++  int DoAuthRead();
++  int DoAuthReadComplete(int result);
++  int DoAssociateWrite();
++  int DoAssociateWriteComplete(int result);
++  int DoAssociateRead();
++  int DoAssociateReadComplete(int result);
++  int DoUdpConnect();
++
++  bool has_credentials() const { return !username_.empty(); }
++
++  // The datagram path, connected to the proxy's relay rather than to
++  // |destination_|.
++  const std::unique_ptr<DatagramClientSocket> udp_socket_;
++  // The control connection, held open so the proxy keeps the association.
++  std::unique_ptr<StreamSocket> control_socket_;
++  const raw_ptr<ClientSocketFactory> client_socket_factory_;
++  // The proxy is named rather than numeric in almost every configuration, so
++  // it is resolved here before the control connection is made.
++  const raw_ptr<HostResolver> host_resolver_;
++  std::unique_ptr<HostResolver::ResolveHostRequest> resolve_request_;
++  AddressList proxy_addresses_;
++
++  const HostPortPair proxy_;
++  const std::string username_;
++  const std::string password_;
++
++  // Where the caller believes it is connected; every datagram names it.
++  IPEndPoint destination_;
++  // Where datagrams are actually sent, as the proxy reported it.
++  IPEndPoint relay_;
++
++  State next_state_ = STATE_NONE;
++  CompletionOnceCallback user_callback_;
++  scoped_refptr<DrainableIOBuffer> write_buf_;
++  scoped_refptr<GrowableIOBuffer> read_buf_;
++  // Set while reading the variable-length part of the associate reply.
++  size_t associate_reply_remaining_ = 0;
++
++  NetworkTrafficAnnotationTag traffic_annotation_;
++  NetLogWithSource net_log_;
++  base::WeakPtrFactory<SOCKS5UDPClientSocket> weak_factory_{this};
++};
++
++}  // namespace net
++
++#endif  // NET_SOCKET_SOCKS5_UDP_CLIENT_SOCKET_H_

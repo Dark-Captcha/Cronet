@@ -20,14 +20,24 @@ from . import socks5_server
 PROXY_LOOPBACK = "<-loopback>"
 
 
-def test_a_proxied_session_cannot_promise_http3() -> None:
-    """Knowable before a request goes out, so it is refused there."""
+def test_an_http_proxy_cannot_promise_http3() -> None:
+    """An HTTP proxy tunnels TCP and has nowhere to put a datagram."""
     with pytest.raises(ValueError) as raised:
-        cronet.Session(proxy="socks5://127.0.0.1:1080", require_http3=True)
+        cronet.Session(proxy="http://127.0.0.1:8080", require_http3=True)
 
     message = str(raised.value)
-    assert "UDP ASSOCIATE" in message, message
+    assert "SOCKS5" in message, message
     assert "HTTP/2" in message, message
+
+
+def test_a_socks5_proxy_may_promise_http3() -> None:
+    """Whether a SOCKS5 proxy relays UDP is only knowable by asking it.
+
+    So this is not refused when the session opens; a proxy that turns out not
+    to relay UDP raises ProtocolDowngraded per response instead.
+    """
+    with cronet.Session(proxy="socks5://127.0.0.1:1080", require_http3=True) as s:
+        assert s.require_http3
 
 
 def test_requiring_http3_while_switching_it_off_is_refused() -> None:
