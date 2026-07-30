@@ -272,6 +272,34 @@ with Session(quic_hints=["cloudflare-quic.com"]) as session:
 A hint is a bare name, or a name with its port as `("example.com", 443)`.
 Pass `http3=False` to switch QUIC off, and `http2=False` to force HTTP/1.1.
 
+### HTTP/3 does not survive a proxy
+
+A request through a proxy arrives over HTTP/2, never HTTP/3, whatever `quic_hints` says and however many requests have gone before it.
+Chromium carries QUIC over a QUIC proxy only, and declines it for every other kind — it never sends the SOCKS5 `UDP ASSOCIATE` that a UDP relay would need, so the proxy is not what is refusing.
+The reasoning, and what changing it would take, is in [`patches/README.md`](patches/README.md).
+
+Nothing announces this.
+`Response.http_version` reads `"h2"`, no error is raised, and Chromium's own comment says the failure "should not be user visible" because the HTTP/2 attempt is expected to take over.
+For traffic that is only worth sending over HTTP/3, that silence is the danger, so it can be turned into a failure:
+
+```python
+from cronet import ProtocolDowngraded, Session
+
+with Session(require_http3=True, quic_hints=["cloudflare-quic.com"]) as session:
+    response = session.get("https://cloudflare-quic.com/")  # h3, or it raises
+```
+
+A response that arrives over anything else raises `ProtocolDowngraded`, which carries the response on `.response` for a caller that would rather inspect than fail.
+A session that cannot reach HTTP/3 at all is refused when it is opened rather than once per request — `require_http3=True` beside a `proxy`, or beside `http3=False`, raises `ValueError` there and then.
+
+Whether a given proxy could ever carry HTTP/3 is a question about the proxy, and `scripts/probe_socks5_udp.py` answers it without involving Chromium:
+
+```bash
+scripts/probe_socks5_udp.py socks5://user:password@proxy.example:1080
+```
+
+It greets the proxy, authenticates, asks for a UDP relay, and sends a real DNS query through it — so a pass means datagrams genuinely flow, not merely that the proxy claimed they would.
+
 ## TLS fingerprints
 
 Chrome does two things that make its handshake deliberately unrepeatable: it shuffles the ClientHello extensions on every connection, and it injects GREASE values in several places.

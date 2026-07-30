@@ -23,7 +23,7 @@ from typing import Self, Unpack
 from . import _bridge, _json
 from ._bridge import CallSettings, EngineSettings
 from .cookies import CookieJar
-from .errors import Timeout
+from .errors import ProtocolDowngraded, Timeout
 from .headers import Headers
 from .request import (
     HeaderSource,
@@ -98,6 +98,7 @@ class _BaseSession:
         accept_language: str | None = None,
         http2: bool = True,
         http3: bool = True,
+        require_http3: bool = False,
         quic_hints: Iterable[QuicHint] | None = None,
         brotli: bool = True,
         cookies: CookieJar | bool = False,
@@ -131,6 +132,11 @@ class _BaseSession:
             http2: Allow HTTP/2.
             http3: Allow HTTP/3 over QUIC. Without a hint below, a host is only
                 reached over HTTP/3 once an earlier response advertised it.
+            require_http3: Fail rather than fall back. A response that did not
+                arrive over HTTP/3 raises `ProtocolDowngraded`, and a session
+                that cannot reach HTTP/3 at all is refused when it is opened.
+                Off by default, because falling back is what a browser does;
+                turn it on where HTTP/2 traffic would be worse than none.
             quic_hints: Hosts already known to speak HTTP/3, as "example.com"
                 or ("example.com", 443), so the first request goes over QUIC.
             brotli: Advertise brotli in Accept-Encoding.
@@ -156,6 +162,22 @@ class _BaseSession:
                 `cronet.request.STACK_OWNED_HEADERS`.
         """
         check_headers(headers, source="the session")
+        # Refused here rather than per request: both of these make HTTP/3
+        # unreachable for the whole session, so every request would raise, and
+        # the one place that can say why is the call that set them up.
+        if require_http3 and not http3:
+            raise ValueError(
+                "require_http3=True contradicts http3=False — one asks for "
+                "HTTP/3 and the other switches it off"
+            )
+        if require_http3 and proxy:
+            raise ValueError(
+                "require_http3=True cannot be met through a proxy: Chromium "
+                "carries QUIC over no proxy protocol, so it never sends the "
+                "SOCKS5 UDP ASSOCIATE that HTTP/3 would need and every request "
+                "would arrive over HTTP/2. Drop the proxy, or require_http3."
+            )
+        self.require_http3 = require_http3
         self.headers = Headers(headers)
         self.timeout = timeout
         self.max_redirects = max_redirects
@@ -255,6 +277,22 @@ class _BaseSession:
         seconds = self._timeout_seconds(options)
         return -1 if seconds is None else max(0, int(seconds * 1000))
 
+    def _checked(self, response: Response) -> Response:
+        """`response`, unless the session required HTTP/3 and did not get it.
+
+        Raises:
+            ProtocolDowngraded: `require_http3` is set and this response
+                arrived over something else.
+        """
+        if self.require_http3 and response.http_version != "h3":
+            raise ProtocolDowngraded(
+                f"{response.url} answered over "
+                f"{response.http_version or 'an unknown protocol'}, not HTTP/3, "
+                "and this session was opened with require_http3=True",
+                response=response,
+            )
+        return response
+
     def _timed_out(self, url: str, options: RequestOptions) -> Timeout:
         """The error a request that ran out of time reports."""
         return Timeout(
@@ -337,7 +375,7 @@ class Session(_BaseSession):
             # Read again now the call has finished: Cronet collects the metrics
             # during teardown, so the metadata seen at the headers is not the
             # final one. This also surfaces a failure that arrived mid-body.
-            return Response.from_raw(call.result(), content)
+            return self._checked(Response.from_raw(call.result(), content))
         finally:
             call.close()
 
@@ -382,7 +420,7 @@ class Session(_BaseSession):
                     raise TimeoutError
             except TimeoutError as expired:
                 raise self._timed_out(target, options) from expired
-            response = Response.from_raw(call.result(), b"")
+            response = self._checked(Response.from_raw(call.result(), b""))
             response.stream = call.iter_body(timeout_ms)
             yield response
         finally:
@@ -487,7 +525,7 @@ class AsyncSession(_BaseSession):
             # Read again now the call has finished: Cronet collects the metrics
             # during teardown, so the metadata seen at the headers is not the
             # final one. This also surfaces a failure that arrived mid-body.
-            return Response.from_raw(call.result(), content)
+            return self._checked(Response.from_raw(call.result(), content))
         finally:
             if not call.wait(0):
                 # Cancelled or timed out rather than finished: stop the request

@@ -70,6 +70,23 @@ class HTTPStatusError(CronetError):
         self.response = response
 
 
+class ProtocolDowngraded(CronetError):
+    """A response did not arrive over HTTP/3, which the session required.
+
+    Falling back to HTTP/2 is what a browser does, so by itself it is not an
+    error and nothing announces it — `Response.http_version` simply reads "h2".
+    That silence is the danger for a caller whose traffic is only worth sending
+    over HTTP/3, which is what `require_http3=True` is for.
+
+    `response` is typed as `object` for the same reason as `HTTPStatusError`
+    above: naming the class here would close an import circle.
+    """
+
+    def __init__(self, message: str, *, response: object) -> None:
+        super().__init__(message)
+        self.response = response
+
+
 # Chromium groups its network errors into bands by first digit, which is what
 # makes a range test meaningful here: -100..-199 is connection, -200..-299 is
 # certificate. The codes below fall inside a band but mean something a caller

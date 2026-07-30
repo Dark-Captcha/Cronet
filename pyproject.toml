@@ -1,6 +1,6 @@
 [project]
 name = "cronet"
-version = "0.2.0"
+version = "0.3.0"
 description = "Chrome's network stack as a Python library — Cronet over ctypes."
 readme = "README.md"
 license = "BSD-3-Clause"
