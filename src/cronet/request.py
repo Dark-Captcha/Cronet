@@ -106,6 +106,47 @@ class RequestOptions(TypedDict, total=False):
     disable_cache: bool
 
 
+# Headers the network stack fills in for itself. A caller that sets one of
+# these does not merely add a value: it moves the name to wherever the caller
+# put it, which is a different request order from the one Chrome sends — and
+# order is exactly what this library exists to reproduce. Chromium accepts them
+# all silently, so nothing downstream would ever report the difference.
+#
+# The value beside each name is what to reach for instead.
+STACK_OWNED_HEADERS = {
+    "accept-encoding": "the session's brotli= setting decides this",
+    "accept-language": "pass accept_language= to the session",
+    "host": "Chromium derives this from the URL",
+    "connection": "Chromium manages connection reuse itself",
+    "content-length": "Chromium counts the body it is given",
+}
+
+
+def check_headers(headers: HeaderSource, *, source: str) -> None:
+    """Reject headers the network stack owns.
+
+    Args:
+        headers: What the caller supplied.
+        source: Where they came from, for the message — "a request" or
+            "the session".
+
+    Raises:
+        ValueError: A header named here is one Chromium fills in itself.
+    """
+    if headers is None:
+        return
+    pairs = headers.items() if isinstance(headers, Mapping) else headers
+    for name, _value in pairs:
+        instead = STACK_OWNED_HEADERS.get(name.lower())
+        if instead is not None:
+            raise ValueError(
+                f"{name!r} was set on {source}, but Chromium sets it itself — "
+                f"{instead}. Setting it by hand moves the header to where you "
+                "put it, which is not where Chrome sends it, so the request "
+                "stops matching a browser's."
+            )
+
+
 def check_options(options: RequestOptions) -> None:
     """Reject anything `request` does not understand.
 

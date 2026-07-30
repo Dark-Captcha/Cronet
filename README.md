@@ -22,6 +22,7 @@ with Session() as session:
 - [Install](#install)
 - [Limitations](#limitations)
 - [Sessions and requests](#sessions-and-requests)
+- [Header order](#header-order)
 - [Redirects](#redirects)
 - [Cookies](#cookies)
 - [Proxies](#proxies)
@@ -158,6 +159,50 @@ The session itself takes the settings its requests share.
 
 Chromium always emits a User-Agent, so `user_agent=""` sends an empty header rather than none at all.
 `version()` returns the Chromium version the bundled library was built from, and `default_user_agent()` the string derived from it.
+
+## Header order
+
+The order headers reach the wire in is a fingerprint, as much as their values are, and reproducing Chrome's is most of the point of this library.
+Headers are sent in the order given, repeats included, and a name the session already set keeps the session's position while taking the request's value.
+
+Some headers are the network stack's rather than the caller's, and passing one is refused:
+
+```python
+session.get(url, headers={"accept-encoding": "gzip, deflate, br"})
+# ValueError: 'accept-encoding' was set on a request, but Chromium sets it
+# itself — the session's brotli= setting decides this. ...
+```
+
+The refused names are `accept-encoding`, `accept-language`, `host`, `connection` and `content-length`.
+Chromium accepts all of them silently, so without this the request would simply stop looking like a browser's and nothing would say so.
+Use `Session(accept_language=...)` for the language, `Session(brotli=...)` for the encoding, and let Chromium derive the rest.
+
+This matters most for `Referer`.
+Chromium strips it from the caller's list and re-appends it — `net/url_request/url_request_http_job.cc` does this so that nothing can override a referrer policy by setting the header — which places it after everything else the caller sent.
+In Chrome that is exactly the right position, because the headers that follow it are added by the network stack rather than by the caller.
+So put `referer` last in your list, leave the stack's own headers alone, and the order comes out as Chrome sends it:
+
+```python
+with Session(accept_language="en-US,en;q=0.9") as session:
+    session.get(
+        url,
+        headers=[
+            ("sec-ch-ua", '"Chromium";v="150", "Not?A_Brand";v="24"'),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-ua-platform", '"Linux"'),
+            ("upgrade-insecure-requests", "1"),
+            ("user-agent", default_user_agent()),
+            ("accept", "text/html,application/xhtml+xml"),
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("referer", "https://example.com/"),
+        ],
+    )
+```
+
+That arrives as the ten above, then `accept-encoding` and `accept-language` from the stack.
+`tests/test_header_order.py` pins this, so a Chromium upgrade that moves a header fails the suite rather than quietly changing what every request looks like.
 
 ## Redirects
 

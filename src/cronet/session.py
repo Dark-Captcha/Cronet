@@ -30,6 +30,7 @@ from .request import (
     RedirectChain,
     RequestOptions,
     build_call,
+    check_headers,
     check_options,
     checked_url,
     with_query,
@@ -151,7 +152,10 @@ class _BaseSession:
         Raises:
             LibraryError: The configuration was rejected — an unparseable proxy
                 rule, or an on-disk cache with no storage_path.
+            ValueError: `headers` names one Chromium fills in itself; see
+                `cronet.request.STACK_OWNED_HEADERS`.
         """
+        check_headers(headers, source="the session")
         self.headers = Headers(headers)
         self.timeout = timeout
         self.max_redirects = max_redirects
@@ -223,6 +227,7 @@ class _BaseSession:
     def _target(self, url: str, options: RequestOptions) -> str:
         """The URL to request, checked and with any query parameters applied."""
         check_options(options)
+        check_headers(options.get("headers"), source="a request")
         return with_query(checked_url(url), options.get("query"))
 
     def _chain(
@@ -294,6 +299,9 @@ class Session(_BaseSession):
             RequestError: The request produced no response; which subclass says
                 what kind of failure it was.
             SessionClosed: The session was already closed.
+            TypeError: An option is not one `request` accepts.
+            ValueError: `headers` names one Chromium fills in itself; see
+                `cronet.request.STACK_OWNED_HEADERS`.
         """
         target = self._target(url, options)
         if self.cookies is None:
