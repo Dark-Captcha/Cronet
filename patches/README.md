@@ -79,6 +79,29 @@ The same file's class comment reads *"Currently no SOCKSv5 authentication is sup
 Residential proxies require authentication, and their usernames carry the country and session selection, so RFC 1929 is not optional for this to be useful.
 It is worth doing on its own: it needs no UDP and no enterprise proxy tier, and it unblocks authenticated residential proxies over HTTP/2 today.
 
+Four files, and the first is the surprising one.
+
+**`net/base/proxy_string_util.cc`**, in `ProxySchemeHostAndPortToProxyServer()`:
+
+```cpp
+if (username_component.is_valid() || password_component.is_valid() ||
+    hostname_component.is_empty()) {
+  return ProxyServer();
+}
+```
+
+Chromium rejects any proxy URI that carries credentials, for every scheme.
+That is why `proxy="socks5://user:password@host:1080"` fails with `ERR_NO_SUPPORTED_PROXIES` (-336) before a connection is attempted: the rule parses to an invalid `ProxyServer`, so the chain has no usable proxy in it.
+The parser already splits the userinfo out — it just throws it away.
+
+**`net/base/proxy_server.{h,cc}`** — carry the username and password that the parser currently discards.
+
+**`net/socket/socks_connect_job.{h,cc}`** — `SOCKSSocketParams` reaches the construction site at `socks_connect_job.cc:179`, which today passes three arguments and would pass the credentials as a fourth.
+
+**`net/socket/socks5_client_socket.{h,cc}`** — offer method `0x02` alongside `0x00` in `kSOCKS5GreetWriteData`, accept it in `DoGreetReadComplete()` where anything but `0x00` is currently an error, and add four states for the RFC 1929 sub-negotiation between the greeting and the existing handshake.
+
+`scripts/probe_socks5_udp.py` implements that same sub-negotiation in Python and is verified against the suite's SOCKS5 server, so it is a working reference for the byte layout.
+
 ### Order of work
 
 Authentication first, since it stands alone and is far smaller.
