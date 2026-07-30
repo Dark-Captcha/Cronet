@@ -15,12 +15,12 @@ Three things are checked in order, and the first failure stops the rest:
     1. the proxy completes a SOCKS5 greeting, and says which authentication
        methods it will take,
     2. it accepts UDP ASSOCIATE and names a relay address,
-    3. a real DNS query sent through that relay comes back answered — which is
-       the only result that proves datagrams actually flow.
+    3. a real QUIC packet sent through that relay comes back answered — which
+       is the only result that proves datagrams actually flow.
 
 Usage:
     scripts/probe_socks5_udp.py socks5://user:password@host:1080
-    scripts/probe_socks5_udp.py socks5://host:1080 --resolver 8.8.8.8
+    scripts/probe_socks5_udp.py socks5://host:1080 --target www.google.com
 """
 
 import argparse
@@ -62,6 +62,10 @@ REPLY_NAMES = {
     0x07: "command not supported",
     0x08: "address type not supported",
 }
+
+
+# How many datagrams to send before calling a relay unresponsive.
+ATTEMPTS = 3
 
 
 class ProbeFailed(Exception):
@@ -201,65 +205,93 @@ def strip_header(datagram: bytes) -> bytes:
     return datagram[start:]
 
 
-def dns_query(name: str) -> tuple[bytes, int]:
-    """A minimal DNS A-record query, and the transaction id to match it by.
+def quic_probe() -> tuple[bytes, bytes]:
+    """A QUIC packet every server answers, and the id its answer must echo.
 
-    A DNS query is used rather than a QUIC Initial because a resolver answers
-    one packet with one packet, so a reply is unambiguous proof that datagrams
-    travelled both ways. QUIC would prove the same thing far less clearly.
+    A long header carrying a version no server implements draws a Version
+    Negotiation packet back, so this proves a QUIC round trip without a
+    handshake or any crypto.
+
+    QUIC is used rather than something simpler because it is the traffic that
+    matters here, and because a relay may carry it and nothing else: a proxy
+    sold as "HTTP/3 support" often forwards port 443 alone, and would fail a
+    DNS probe while carrying HTTP/3 perfectly well.
     """
-    transaction_id = secrets.randbelow(0x10000)
-    question = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
-    return (
-        struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0)
-        + question
-        + b"\x00"
-        + struct.pack("!HH", 1, 1),
-        transaction_id,
+    source_id = secrets.token_bytes(8)
+    packet = (
+        bytes([0xC0])  # long header, fixed bit set
+        + struct.pack("!I", 0x1A2A3A4A)  # a version deliberately unknown
+        + bytes([8])
+        + secrets.token_bytes(8)  # destination connection id
+        + bytes([len(source_id)])
+        + source_id
     )
+    # A QUIC Initial under 1200 bytes is dropped without a reply.
+    return packet.ljust(1200, b"\x00"), source_id
 
 
-def relay_a_datagram(relay: tuple[str, int], resolver: str, timeout: float) -> str:
-    """Send one DNS query through the relay and read the answer.
+def relay_a_datagram(relay: tuple[str, int], target: str, timeout: float) -> str:
+    """Send one QUIC packet through the relay and read the answer.
+
+    Args:
+        relay: Where the proxy said to send datagrams.
+        target: The QUIC server to reach, as a host name.
+        timeout: Seconds to wait for the answer.
 
     Returns:
         A line describing what came back.
 
     Raises:
-        ProbeFailed: Nothing came back, or it was not the answer asked for.
+        ProbeFailed: Nothing came back, or it was not a QUIC answer.
     """
-    query, transaction_id = dns_query("example.com")
-    datagram = encapsulate(resolver, 53, query)
+    # Resolved to IPv4 on purpose: relays are commonly IPv4-only, and an IPv6
+    # destination is then dropped without a reply — which would read as "this
+    # proxy cannot carry HTTP/3" when the truth is narrower than that.
+    sockaddr = socket.getaddrinfo(target, 443, socket.AF_INET)[0][4]
+    address = str(sockaddr[0])
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-        udp.settimeout(timeout)
-        udp.sendto(datagram, relay)
-        try:
-            answer, _source = udp.recvfrom(4096)
-        except TimeoutError as expired:
-            raise ProbeFailed(
-                f"the relay accepted the datagram but nothing came back within "
-                f"{timeout}s — the association was granted and then not honoured"
-            ) from expired
+    # Retried because a residential relay drops the occasional first datagram
+    # while it picks an exit node, and one lost packet would otherwise read as
+    # "this proxy cannot carry HTTP/3" — the wrong answer to the one question
+    # this tool exists to settle. UDP has no retransmission of its own.
+    answer = b""
+    for attempt in range(1, ATTEMPTS + 1):
+        packet, _source_id = quic_probe()
+        datagram = encapsulate(address, 443, packet)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.settimeout(timeout / ATTEMPTS)
+            udp.sendto(datagram, relay)
+            try:
+                answer, _source = udp.recvfrom(4096)
+                break
+            except TimeoutError:
+                if attempt == ATTEMPTS:
+                    raise ProbeFailed(
+                        f"the relay accepted the datagram but no QUIC answer "
+                        f"came back from {target} ({address}) in {ATTEMPTS} "
+                        f"attempts over {timeout}s — the association was "
+                        "granted and then not honoured"
+                    ) from None
 
     payload = strip_header(answer)
-    if len(payload) < 4:
+    if len(payload) < 5:
         raise ProbeFailed(
-            f"the relayed answer was {len(payload)} bytes, too short for DNS"
+            f"the relayed answer was {len(payload)} bytes, too short to be QUIC"
         )
-    returned_id, flags = struct.unpack("!HH", payload[:4])
-    if returned_id != transaction_id:
+    if not payload[0] & 0x80:
+        raise ProbeFailed("the relayed answer was not a QUIC long header")
+    version = struct.unpack("!I", payload[1:5])[0]
+    if version != 0:
         raise ProbeFailed(
-            f"the answer carried transaction id {returned_id}, not {transaction_id}"
+            f"expected a Version Negotiation packet, got QUIC version 0x{version:08x}"
         )
-    answers = struct.unpack("!H", payload[6:8])[0]
     return (
-        f"a DNS answer came back through the relay, "
-        f"{answers} record(s), flags 0x{flags:04x}"
+        f"a QUIC Version Negotiation answer came back from {target}, "
+        f"{len(payload)} bytes — datagrams travel both ways"
     )
 
 
-def probe(url: str, resolver: str, timeout: float) -> int:
+def probe(url: str, target: str, timeout: float) -> int:
     """Run the three checks against `url`, printing each. Returns an exit code."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("socks5", "socks5h"):
@@ -295,7 +327,7 @@ def probe(url: str, resolver: str, timeout: float) -> int:
 
             # The control connection must stay open, so the relay is used from
             # inside this block: a proxy drops the association when it closes.
-            print(f"  [3/3] {relay_a_datagram(relay, resolver, timeout)}")
+            print(f"  [3/3] {relay_a_datagram(relay, target, timeout)}")
     except ProbeFailed as failure:
         print(f"  FAILED: {failure}")
         print()
@@ -317,9 +349,9 @@ def main() -> int:
     )
     parser.add_argument("url", help="socks5://[user:password@]host:port")
     parser.add_argument(
-        "--resolver",
-        default="1.1.1.1",
-        help="the DNS server to reach through the relay (default: 1.1.1.1)",
+        "--target",
+        default="cloudflare-quic.com",
+        help="a QUIC server to reach through the relay (default: cloudflare-quic.com)",
     )
     parser.add_argument(
         "--timeout",
@@ -328,7 +360,7 @@ def main() -> int:
         help="seconds to wait for each step (default: 10)",
     )
     arguments = parser.parse_args()
-    return probe(arguments.url, arguments.resolver, arguments.timeout)
+    return probe(arguments.url, arguments.target, arguments.timeout)
 
 
 if __name__ == "__main__":

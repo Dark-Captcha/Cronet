@@ -309,7 +309,8 @@ Whether a given proxy could ever carry HTTP/3 is a question about the proxy, and
 scripts/probe_socks5_udp.py socks5://user:password@proxy.example:1080
 ```
 
-It greets the proxy, authenticates, asks for a UDP relay, and sends a real DNS query through it — so a pass means datagrams genuinely flow, not merely that the proxy claimed they would.
+It greets the proxy, authenticates, asks for a UDP relay, and sends a real QUIC packet through it — so a pass means datagrams genuinely flow, not merely that the proxy claimed they would.
+QUIC rather than something simpler because a relay may carry it and nothing else: a proxy sold as supporting HTTP/3 often forwards port 443 alone, and a probe using anything else would call it broken while it carries HTTP/3 perfectly well.
 
 ## TLS fingerprints
 
