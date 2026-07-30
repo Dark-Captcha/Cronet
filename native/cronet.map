@@ -1,0 +1,18 @@
+/* What libcronet.so is allowed to export.
+ *
+ * Without this, the library exports hundreds of symbols rather than the 17 the
+ * ABI declares: malloc and its whole family, every operator new and delete, the
+ * Rust CXX bridge, and an interposition of close(). None of that is reachable
+ * through the ABI, and all of it is a collision waiting for the first process
+ * that loads another library built from the same Chromium pieces.
+ *
+ * Today's load order happens to be safe — glibc is already in the global scope
+ * before this library is dlopen'd, so it wins. This makes load order stop
+ * mattering, which is the part that keeps being true.
+ */
+{
+  global:
+    cronet_*;
+  local:
+    *;
+};

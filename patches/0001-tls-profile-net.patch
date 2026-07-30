@@ -1,0 +1,492 @@
+diff --git a/components/cronet/url_request_context_config.cc b/components/cronet/url_request_context_config.cc
+index f006624088180..99056b8a60eef 100644
+--- a/components/cronet/url_request_context_config.cc
++++ b/components/cronet/url_request_context_config.cc
+@@ -6,8 +6,12 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
+ #include <type_traits>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/feature_list.h"
+ #include "base/json/json_reader.h"
+@@ -35,7 +39,10 @@
+ #include "net/log/net_log.h"
+ #include "net/nqe/network_quality_estimator_params.h"
+ #include "net/quic/set_quic_flag.h"
++#include "net/socket/next_proto.h"
+ #include "net/socket/ssl_client_socket.h"
++#include "net/ssl/ssl_config.h"
++#include "net/ssl/ssl_config_service.h"
+ #include "net/ssl/ssl_key_logger_impl.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/quic_packets.h"
+@@ -181,6 +188,31 @@ const char kStaleDnsUseStaleOnNameNotResolved[] =
+ const char kHostResolverRulesFieldTrialName[] = "HostResolverRules";
+ const char kHostResolverRules[] = "host_resolver_rules";
+ 
++// Explicit TLS ClientHello profile dictionary name. Every member is optional;
++// an absent member keeps Chromium's own behaviour for that part of the
++// ClientHello.
++const char kTlsProfileFieldTrialName[] = "tls_profile";
++// Name of list of cipher suite code points to offer, in order.
++const char kTlsProfileCipherSuites[] = "cipher_suites";
++// Name of list of TLS extension type code points, in the order the extensions
++// must appear in the ClientHello.
++const char kTlsProfileExtensionOrder[] = "extension_order";
++// Name of list of named group code points for the supported_groups extension.
++const char kTlsProfileSupportedGroups[] = "supported_groups";
++// Name of list of named group code points to send key shares for.
++const char kTlsProfileKeyShareGroups[] = "key_share_groups";
++// Name of list of signature algorithm code points, in order.
++const char kTlsProfileSignatureAlgorithms[] = "signature_algorithms";
++// Name of list of ALPN protocol strings, in order, e.g. ["h2", "http/1.1"].
++const char kTlsProfileAlpn[] = "alpn";
++// Names of the minimum and maximum TLS versions, as "1.2" or "1.3".
++const char kTlsProfileMinVersion[] = "min_version";
++const char kTlsProfileMaxVersion[] = "max_version";
++// Name of boolean controlling whether GREASE values are sent (RFC 8701).
++const char kTlsProfileGrease[] = "grease";
++// Name of boolean controlling whether the extensions are randomly permuted.
++const char kTlsProfilePermuteExtensions[] = "permute_extensions";
++
+ // NetworkQualityEstimator (NQE) experiment dictionary name.
+ const char kNetworkQualityEstimatorFieldTrialName[] = "NetworkQualityEstimator";
+ 
+@@ -279,6 +311,156 @@ auto map(std::optional<T> maybe, F&& f) {
+   return std::optional<std::invoke_result_t<F, T>>(f(maybe.value()));
+ }
+ 
++// Reads the list at |key| in |args| as TLS code points into |out|. Returns
++// false, leaving |out| untouched, if the list is present but any element is not
++// an integer that fits in a uint16_t. A missing list is not an error and leaves
++// |out| untouched.
++bool ParseTlsCodePointList(const base::DictValue& args,
++                           std::string_view key,
++                           std::vector<uint16_t>* out) {
++  const base::ListValue* list = args.FindList(key);
++  if (!list) {
++    return true;
++  }
++  std::vector<uint16_t> code_points;
++  code_points.reserve(list->size());
++  for (const base::Value& element : *list) {
++    std::optional<int> code_point = element.GetIfInt();
++    if (!code_point.has_value() || *code_point < 0 || *code_point > 0xffff) {
++      LOG(ERROR) << "\"" << kTlsProfileFieldTrialName << "\" member \"" << key
++                 << "\" contains \"" << element
++                 << "\", which is not a TLS code point";
++      return false;
++    }
++    code_points.push_back(static_cast<uint16_t>(*code_point));
++  }
++  *out = std::move(code_points);
++  return true;
++}
++
++// Reads the TLS version string at |key| in |args| into |out|. Returns false,
++// leaving |out| untouched, if the value is present but not a supported version.
++// A missing value is not an error and leaves |out| untouched.
++bool ParseTlsVersion(const base::DictValue& args,
++                     std::string_view key,
++                     std::optional<uint16_t>* out) {
++  const std::string* version = args.FindString(key);
++  if (!version) {
++    return true;
++  }
++  if (*version == "1.2") {
++    *out = net::SSL_PROTOCOL_VERSION_TLS1_2;
++  } else if (*version == "1.3") {
++    *out = net::SSL_PROTOCOL_VERSION_TLS1_3;
++  } else {
++    LOG(ERROR) << "\"" << kTlsProfileFieldTrialName << "\" member \"" << key
++               << "\" is \"" << *version << "\", which is not \"1.2\" or"
++               << " \"1.3\"";
++    return false;
++  }
++  return true;
++}
++
++// Reads the boolean at |key| in |args| into |out|. Returns false, leaving |out|
++// untouched, if the value is present but not a boolean. A missing value is not
++// an error and leaves |out| untouched.
++bool ParseTlsBool(const base::DictValue& args,
++                  std::string_view key,
++                  std::optional<bool>* out) {
++  const base::Value* value = args.Find(key);
++  if (!value) {
++    return true;
++  }
++  if (!value->is_bool()) {
++    LOG(ERROR) << "\"" << kTlsProfileFieldTrialName << "\" member \"" << key
++               << "\" is \"" << *value << "\", which is not a bool";
++    return false;
++  }
++  *out = value->GetBool();
++  return true;
++}
++
++// Reads |args| as a TLS ClientHello profile. Returns nullopt if any member is
++// malformed, so that a bad profile fails loudly rather than silently producing
++// a ClientHello the caller did not ask for.
++std::optional<net::TlsProfile> ParseTlsProfile(const base::DictValue& args) {
++  net::TlsProfile profile;
++  if (!ParseTlsCodePointList(args, kTlsProfileCipherSuites,
++                             &profile.cipher_suites) ||
++      !ParseTlsCodePointList(args, kTlsProfileExtensionOrder,
++                             &profile.extension_order) ||
++      !ParseTlsCodePointList(args, kTlsProfileSupportedGroups,
++                             &profile.supported_groups) ||
++      !ParseTlsCodePointList(args, kTlsProfileKeyShareGroups,
++                             &profile.key_share_groups) ||
++      !ParseTlsCodePointList(args, kTlsProfileSignatureAlgorithms,
++                             &profile.signature_algorithms) ||
++      !ParseTlsVersion(args, kTlsProfileMinVersion, &profile.min_version) ||
++      !ParseTlsVersion(args, kTlsProfileMaxVersion, &profile.max_version)) {
++    return std::nullopt;
++  }
++
++  // A real fingerprint may name an extension whose position is not BoringSSL's
++  // to choose, padding being the likely one. Report those and carry on with the
++  // rest, rather than failing every connection over an entry that would have
++  // been written anyway.
++  for (uint16_t extension_type : profile.RemoveUnorderableExtensions()) {
++    LOG(ERROR) << "\"" << kTlsProfileFieldTrialName << "\" member \""
++               << kTlsProfileExtensionOrder << "\" names extension "
++               << extension_type
++               << ", whose position BoringSSL does not control; ignoring it";
++  }
++
++  const base::ListValue* alpn = args.FindList(kTlsProfileAlpn);
++  if (alpn) {
++    for (const base::Value& element : *alpn) {
++      const std::string* proto_string = element.GetIfString();
++      net::NextProto proto = proto_string
++                                 ? net::NextProtoFromString(*proto_string)
++                                 : net::NextProto::kProtoUnknown;
++      if (proto == net::NextProto::kProtoUnknown) {
++        LOG(ERROR) << "\"" << kTlsProfileFieldTrialName << "\" member \""
++                   << kTlsProfileAlpn << "\" contains \"" << element
++                   << "\", which is not a known ALPN protocol";
++        return std::nullopt;
++      }
++      profile.alpn.push_back(proto);
++    }
++  }
++
++  if (!ParseTlsBool(args, kTlsProfileGrease, &profile.grease) ||
++      !ParseTlsBool(args, kTlsProfilePermuteExtensions,
++                    &profile.permute_extensions)) {
++    return std::nullopt;
++  }
++  return profile;
++}
++
++// An SSLConfigService that serves one fixed configuration, differing from the
++// default only by the TLS profile it carries.
++class TlsProfileSSLConfigService : public net::SSLConfigService {
++ public:
++  explicit TlsProfileSSLConfigService(net::TlsProfile profile) {
++    config_.tls_profile = std::move(profile);
++  }
++
++  TlsProfileSSLConfigService(const TlsProfileSSLConfigService&) = delete;
++  TlsProfileSSLConfigService& operator=(const TlsProfileSSLConfigService&) =
++      delete;
++
++  ~TlsProfileSSLConfigService() override = default;
++
++  net::SSLContextConfig GetSSLContextConfig() override { return config_; }
++
++  bool CanShareConnectionWithClientCerts(
++      std::string_view hostname) const override {
++    return false;
++  }
++
++ private:
++  net::SSLContextConfig config_;
++};
++
+ }  // namespace
+ 
+ URLRequestContextConfig::QuicHint::QuicHint(const std::string& host,
+@@ -776,6 +958,22 @@ void URLRequestContextConfig::SetContextBuilderExperimentalOptions(
+         continue;
+       }
+       session_params->spdy_go_away_on_ip_change = iter->second.GetBool();
++    } else if (iter->first == kTlsProfileFieldTrialName) {
++      if (!iter->second.is_dict()) {
++        LOG(ERROR) << "\"" << iter->first << "\" config params \""
++                   << iter->second << "\" is not a dictionary value";
++        effective_experimental_options.Remove(iter->first);
++        continue;
++      }
++      std::optional<net::TlsProfile> tls_profile =
++          ParseTlsProfile(iter->second.GetDict());
++      if (!tls_profile.has_value()) {
++        effective_experimental_options.Remove(iter->first);
++        continue;
++      }
++      context_builder->set_ssl_config_service(
++          std::make_unique<TlsProfileSSLConfigService>(
++              std::move(tls_profile).value()));
+     } else {
+       LOG(WARNING) << "Unrecognized Cronet experimental option \""
+                    << iter->first << "\" with params \"" << iter->second;
+diff --git a/net/socket/ssl_client_socket_impl.cc b/net/socket/ssl_client_socket_impl.cc
+index b3d4cb912fb44..7fccff5d33258 100644
+--- a/net/socket/ssl_client_socket_impl.cc
++++ b/net/socket/ssl_client_socket_impl.cc
+@@ -690,14 +690,29 @@ int SSLClientSocketImpl::Init() {
+     return ERR_UNEXPECTED;
+   }
+ 
++  // An explicit ClientHello profile, if one was configured. Every part of it is
++  // optional; the parts left unset keep the behaviour above and below.
++  const TlsProfile& tls_profile = context_->config().tls_profile;
++
+   const std::vector<uint16_t> supported_groups =
+-      context_->config().GetSupportedGroups();
++      tls_profile.supported_groups.empty()
++          ? context_->config().GetSupportedGroups()
++          : tls_profile.supported_groups;
+   if (!SSL_set1_group_ids(ssl_.get(), supported_groups.data(),
+                           supported_groups.size())) {
+     return ERR_UNEXPECTED;
+   }
+-  const std::vector<uint16_t> key_shares =
+-      context_->config().GetSupportedGroups(/*key_shares_only=*/true);
++  // The key shares must be a subsequence of the supported groups, so when the
++  // profile replaces the group list without naming key shares, leave the choice
++  // to BoringSSL's default logic rather than applying Chromium's, which was
++  // derived from a different group list.
++  std::vector<uint16_t> key_shares;
++  if (!tls_profile.key_share_groups.empty()) {
++    key_shares = tls_profile.key_share_groups;
++  } else if (tls_profile.supported_groups.empty()) {
++    key_shares =
++        context_->config().GetSupportedGroups(/*key_shares_only=*/true);
++  }
+   if (!key_shares.empty() &&
+       !SSL_set1_client_key_shares(ssl_.get(), key_shares.data(),
+                                   key_shares.size())) {
+@@ -736,10 +751,12 @@ int SSLClientSocketImpl::Init() {
+   BIO_up_ref(transport_bio);  // SSL_set0_wbio takes ownership.
+   SSL_set0_wbio(ssl_.get(), transport_bio);
+ 
+-  uint16_t version_min =
+-      ssl_config_.version_min_override.value_or(context_->config().version_min);
+-  uint16_t version_max =
+-      ssl_config_.version_max_override.value_or(context_->config().version_max);
++  uint16_t version_min = tls_profile.min_version.value_or(
++      ssl_config_.version_min_override.value_or(
++          context_->config().version_min));
++  uint16_t version_max = tls_profile.max_version.value_or(
++      ssl_config_.version_max_override.value_or(
++          context_->config().version_max));
+   if (version_min < TLS1_2_VERSION || version_max < TLS1_2_VERSION) {
+     // TLS versions before TLS 1.2 are no longer supported.
+     return ERR_UNEXPECTED;
+@@ -780,6 +797,16 @@ int SSLClientSocketImpl::Init() {
+     return ERR_UNEXPECTED;
+   }
+ 
++  // The cipher list above decides what may be negotiated; the profile, if it
++  // names cipher suites, decides what is written on the wire and in what order.
++  if (!tls_profile.cipher_suites.empty() &&
++      !SSL_set1_client_cipher_suites(ssl_.get(),
++                                     tls_profile.cipher_suites.data(),
++                                     tls_profile.cipher_suites.size())) {
++    LOG(ERROR) << "SSL_set1_client_cipher_suites failed";
++    return ERR_UNEXPECTED;
++  }
++
+   // Disable SHA-1 server signatures.
+   // TODO(crbug.com/boringssl/699): Once the default is flipped in BoringSSL, we
+   // no longer need to override it.
+@@ -802,7 +829,14 @@ int SSLClientSocketImpl::Init() {
+       SSL_SIGN_RSA_PSS_RSAE_SHA512,
+       SSL_SIGN_RSA_PKCS1_SHA512,
+   };
+-  if (base::FeatureList::IsEnabled(features::kTlsMldsaSignatures)) {
++  if (!tls_profile.signature_algorithms.empty()) {
++    if (!SSL_set_verify_algorithm_prefs(
++            ssl_.get(), tls_profile.signature_algorithms.data(),
++            tls_profile.signature_algorithms.size())) {
++      LOG(ERROR) << "SSL_set_verify_algorithm_prefs failed";
++      return ERR_UNEXPECTED;
++    }
++  } else if (base::FeatureList::IsEnabled(features::kTlsMldsaSignatures)) {
+     if (!SSL_set_verify_algorithm_prefs(ssl_.get(), kVerifyPrefsWithMlDsa,
+                                         std::size(kVerifyPrefsWithMlDsa))) {
+       return ERR_UNEXPECTED;
+@@ -818,12 +852,13 @@ int SSLClientSocketImpl::Init() {
+       ssl_.get(),
+       base::FeatureList::IsEnabled(features::kUseNewAlpsCodepointHttp2));
+ 
+-  if (!ssl_config_.alpn_protos.empty()) {
+-    std::vector<uint8_t> wire_protos =
+-        SerializeNextProtos(ssl_config_.alpn_protos);
++  const NextProtoVector& alpn_protos =
++      tls_profile.alpn.empty() ? ssl_config_.alpn_protos : tls_profile.alpn;
++  if (!alpn_protos.empty()) {
++    std::vector<uint8_t> wire_protos = SerializeNextProtos(alpn_protos);
+     SSL_set_alpn_protos(ssl_.get(), wire_protos.data(), wire_protos.size());
+ 
+-    for (NextProto proto : ssl_config_.alpn_protos) {
++    for (NextProto proto : alpn_protos) {
+       auto iter = ssl_config_.application_settings.find(proto);
+       if (iter != ssl_config_.application_settings.end()) {
+         const char* proto_string = NextProtoToString(proto);
+@@ -876,7 +911,21 @@ int SSLClientSocketImpl::Init() {
+     }
+   }
+ 
+-  SSL_set_permute_extensions(ssl_.get(), 1);
++  SSL_set_permute_extensions(
++      ssl_.get(), tls_profile.permute_extensions.value_or(true) ? 1 : 0);
++
++  // An explicit extension order overrides the permutation above.
++  if (!tls_profile.extension_order.empty() &&
++      !SSL_set1_extension_order(ssl_.get(), tls_profile.extension_order.data(),
++                                tls_profile.extension_order.size())) {
++    LOG(ERROR) << "SSL_set1_extension_order failed; the profile names an "
++                  "extension that is unsupported or repeated";
++    return ERR_UNEXPECTED;
++  }
++
++  if (tls_profile.grease.has_value()) {
++    SSL_set_grease_enabled(ssl_.get(), *tls_profile.grease ? 1 : 0);
++  }
+ 
+   // Configure BoringSSL to send Trust Anchor IDs, if provided.
+   if (ssl_config_.trust_anchor_ids.has_value()) {
+diff --git a/net/ssl/ssl_config_service.cc b/net/ssl/ssl_config_service.cc
+index 4aa74001250f7..8c1509b140e3d 100644
+--- a/net/ssl/ssl_config_service.cc
++++ b/net/ssl/ssl_config_service.cc
+@@ -116,6 +116,26 @@ void AddIntersectingMTCTrustAnchorIdsToEncodedList(
+ 
+ }  // namespace
+ 
++TlsProfile::TlsProfile() = default;
++TlsProfile::TlsProfile(const TlsProfile&) = default;
++TlsProfile::TlsProfile(TlsProfile&&) = default;
++TlsProfile::~TlsProfile() = default;
++TlsProfile& TlsProfile::operator=(const TlsProfile&) = default;
++TlsProfile& TlsProfile::operator=(TlsProfile&&) = default;
++bool TlsProfile::operator==(const TlsProfile&) const = default;
++
++std::vector<uint16_t> TlsProfile::RemoveUnorderableExtensions() {
++  std::vector<uint16_t> removed;
++  std::erase_if(extension_order, [&removed](uint16_t extension_type) {
++    if (SSL_extension_order_supported(extension_type)) {
++      return false;
++    }
++    removed.push_back(extension_type);
++    return true;
++  });
++  return removed;
++}
++
+ SSLContextConfig::SSLContextConfig() {
+   supported_named_groups.assign(std::begin(kDefaultSSLSupportedGroups),
+                                 std::end(kDefaultSSLSupportedGroups));
+diff --git a/net/ssl/ssl_config_service.h b/net/ssl/ssl_config_service.h
+index 6709cde28c46f..752280433d531 100644
+--- a/net/ssl/ssl_config_service.h
++++ b/net/ssl/ssl_config_service.h
+@@ -30,6 +30,77 @@ struct NET_EXPORT SSLNamedGroupInfo {
+   bool operator==(const SSLNamedGroupInfo&) const = default;
+ };
+ 
++// An explicitly specified TLS ClientHello profile, used to reproduce a
++// particular handshake fingerprint instead of Chromium's own.
++//
++// Every member is optional: an empty list or an unset optional means "keep
++// Chromium's behaviour for this part of the ClientHello". A default-constructed
++// TlsProfile therefore changes nothing at all, and the bytes on the wire are
++// exactly what they would be without it.
++//
++// Numeric members are IANA code points in host byte order (e.g. 0x1301 for
++// TLS_AES_128_GCM_SHA256, 23 for secp256r1).
++struct NET_EXPORT TlsProfile {
++  TlsProfile();
++  TlsProfile(const TlsProfile&);
++  TlsProfile(TlsProfile&&);
++  ~TlsProfile();
++  TlsProfile& operator=(const TlsProfile&);
++  TlsProfile& operator=(TlsProfile&&);
++
++  bool operator==(const TlsProfile&) const;
++
++  // Removes from `extension_order` every extension whose position in the
++  // ClientHello BoringSSL does not control, such as padding, and returns the
++  // code points removed. Those extensions are still sent; only their position
++  // is not the caller's to choose. Code that builds a profile from user input
++  // should call this once, when the profile is built, so that an unorderable
++  // entry is reported there instead of failing every connection.
++  std::vector<uint16_t> RemoveUnorderableExtensions();
++
++  // Cipher suites to offer, in exactly this order. This controls only what is
++  // advertised; which suites may actually be negotiated is still decided by
++  // net's own cipher policy, so a suite listed here that net would not accept
++  // will fail the handshake if the server selects it.
++  std::vector<uint16_t> cipher_suites;
++
++  // TLS ExtensionType code points, in the order the extensions must appear in
++  // the ClientHello. Extensions that are omitted here are still sent, after the
++  // listed ones. Listing an extension does not cause it to be sent if it would
++  // not have been sent anyway. Every entry must be an extension BoringSSL
++  // implements, or the connection fails.
++  std::vector<uint16_t> extension_order;
++
++  // Named groups for the supported_groups extension, in order.
++  std::vector<uint16_t> supported_groups;
++
++  // Named groups to send key shares for, in order. Must be a subsequence of the
++  // supported groups. If empty while `supported_groups` is set, BoringSSL's
++  // default key share selection for that group list is used.
++  std::vector<uint16_t> key_share_groups;
++
++  // Signature algorithm code points for the signature_algorithms extension, in
++  // order.
++  std::vector<uint16_t> signature_algorithms;
++
++  // ALPN protocols to offer, in order, replacing the ones the session asked
++  // for.
++  NextProtoVector alpn;
++
++  // Minimum and maximum protocol versions, as SSL_PROTOCOL_VERSION_* values.
++  // These take precedence over both the per-socket overrides and the context
++  // configuration.
++  std::optional<uint16_t> min_version;
++  std::optional<uint16_t> max_version;
++
++  // Whether to send GREASE values (RFC 8701).
++  std::optional<bool> grease;
++
++  // Whether to randomly permute the ClientHello extensions. Ignored when
++  // `extension_order` is set, which always wins.
++  std::optional<bool> permute_extensions;
++};
++
+ // Configuration options for SSL connections.
+ struct NET_EXPORT SSLContextConfig {
+   SSLContextConfig();
+@@ -120,6 +191,10 @@ struct NET_EXPORT SSLContextConfig {
+   // MtcMetadata was generated. See MtcMetadata.update_time_seconds in
+   // net/cert/root_store.proto.
+   int64_t mtc_update_time_seconds = 0;
++
++  // An explicit ClientHello profile. Empty by default, in which case the
++  // ClientHello is built exactly as it would be without this field.
++  TlsProfile tls_profile;
+ };
+ 
+ // The interface for retrieving global SSL configuration.  This interface

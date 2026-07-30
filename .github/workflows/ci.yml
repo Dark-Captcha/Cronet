@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    # The bundled library is Linux x86-64, so there is nowhere else to run this.
+    runs-on: ubuntu-24.04
+    strategy:
+      # Both builds run to the end even when one fails, because the interesting
+      # failure is almost always the one that happens on a single build.
+      fail-fast: false
+      matrix:
+        # The standard build and the free-threaded one. Both are tested because
+        # this package holds native handles across threads and releases the GIL
+        # for the whole of a request, so a race the GIL happens to hide on 3.14
+        # is a real one on 3.14t.
+        python:
+          - "3.14"
+          - "3.14t"
+    name: gates (${{ matrix.python }})
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # libcronet.so links these directly; the runner image carries GLib but not
+      # every NSS piece, and the failure without them is a load error at import.
+      - name: Install the system libraries libcronet.so links
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libglib2.0-0 libnss3
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      # --all-groups pulls in msgspec, so the accelerated JSON path is the one
+      # under test here; test_json_backend.py forces the stdlib fallback itself.
+      - name: Install the project
+        run: uv sync --python ${{ matrix.python }} --all-groups
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python }} ruff check .
+
+      - name: Format
+        run: uv run --python ${{ matrix.python }} ruff format --check .
+
+      - name: Types
+        run: uv run --python ${{ matrix.python }} mypy .
+
+      - name: Tests
+        run: uv run --python ${{ matrix.python }} pytest
+
+  wheel:
+    # A wheel that says `any` would install on macOS and Windows and then fail
+    # at the first import, so the tag is checked rather than assumed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Build the wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Check its tag and contents
+        run: |
+          set -euo pipefail
+          ls dist/
+          wheel=$(ls dist/*.whl)
+          case "$wheel" in
+            *-py3-none-linux_x86_64.whl) echo "tag ok: $wheel" ;;
+            *) echo "unexpected wheel tag: $wheel" >&2; exit 1 ;;
+          esac
+          unzip -l "$wheel" | grep -q 'cronet/libcronet.so' || {
+            echo "the wheel is missing libcronet.so" >&2; exit 1; }
+          unzip -l "$wheel" | grep -q 'LICENSE' || {
+            echo "the wheel is missing the LICENSE" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: wheel
+          path: dist/*.whl
