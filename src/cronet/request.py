@@ -122,6 +122,39 @@ STACK_OWNED_HEADERS = {
 }
 
 
+def with_proxy_credentials(rules: str, username: str, password: str) -> str:
+    """`rules` with credentials folded into a lone SOCKS5 URL.
+
+    Chromium carries SOCKS5 credentials in the proxy URL's userinfo, while an
+    HTTP proxy takes them through its own 407 exchange. Callers should not have
+    to know which, so `proxy_username` and `proxy_password` are moved into the
+    URL here when the rule is a single SOCKS5 one.
+
+    Anything else is returned untouched: a multi-scheme rule string names more
+    than one proxy, and guessing which was meant would be worse than leaving it
+    to be spelled out in the URL.
+
+    Args:
+        rules: The proxy rules the caller gave.
+        username: The username, empty when none was given.
+        password: The password.
+
+    Returns:
+        The rules to hand to Chromium.
+    """
+    if not username or not rules.startswith(("socks5://", "socks4://")):
+        return rules
+    parts = urllib.parse.urlsplit(rules)
+    # An explicit userinfo wins: the caller spelled it out for this one proxy.
+    if parts.username or not parts.hostname:
+        return rules
+    quoted = urllib.parse.quote(username, safe="")
+    if password:
+        quoted += ":" + urllib.parse.quote(password, safe="")
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{quoted}@{parts.hostname}{port}{parts.path}"
+
+
 def check_headers(headers: HeaderSource, *, source: str) -> None:
     """Reject headers the network stack owns.
 

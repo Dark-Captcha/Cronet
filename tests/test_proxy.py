@@ -97,11 +97,12 @@ def test_requests_still_work_after_the_proxy_refuses_one(server: str) -> None:
         assert session.get(f"{server}/echo").status_code == 200
 
 
-@pytest.mark.xfail(
-    reason="Chromium's SOCKS5 client does not implement RFC 1929 yet",
-    strict=True,
-)
 def test_a_socks5_proxy_that_demands_a_password_is_satisfied(server: str) -> None:
+    """RFC 1929, added by patches/0003-socks5-auth.patch.
+
+    Upstream Chromium offers only the "no authentication" method, so this was a
+    strict xfail until the bundled library carried the patch.
+    """
     with socks5_server.running("someone", "secret") as proxy:
         with cronet.Session(
             proxy=proxy.url,

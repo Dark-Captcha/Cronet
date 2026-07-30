@@ -33,6 +33,7 @@ from .request import (
     check_headers,
     check_options,
     checked_url,
+    with_proxy_credentials,
     with_query,
 )
 from .response import Response
@@ -201,7 +202,9 @@ class _BaseSession:
                 accept_language=accept_language or "",
                 experimental_options=_json.encode(options).decode() if options else "",
                 storage_path=storage_path or "",
-                proxy_rules=proxy or "",
+                proxy_rules=with_proxy_credentials(
+                    proxy or "", proxy_username or "", proxy_password or ""
+                ),
                 proxy_bypass_rules=proxy_bypass or "",
                 proxy_username=proxy_username or "",
                 proxy_password=proxy_password or "",

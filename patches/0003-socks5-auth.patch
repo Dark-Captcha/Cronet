@@ -1,0 +1,546 @@
+diff --git a/net/base/proxy_server.cc b/net/base/proxy_server.cc
+index 42554e1332863..e8c6c6d70e05c 100644
+--- a/net/base/proxy_server.cc
++++ b/net/base/proxy_server.cc
+@@ -42,6 +42,13 @@ bool IsValidSchemeInt(int scheme_int) {
+ 
+ }  // namespace
+ 
++ProxyServer::ProxyServer() = default;
++ProxyServer::ProxyServer(const ProxyServer&) = default;
++ProxyServer::ProxyServer(ProxyServer&&) noexcept = default;
++ProxyServer& ProxyServer::operator=(const ProxyServer&) = default;
++ProxyServer& ProxyServer::operator=(ProxyServer&&) noexcept = default;
++ProxyServer::~ProxyServer() = default;
++
+ ProxyServer::ProxyServer(Scheme scheme, const HostPortPair& host_port_pair)
+       : scheme_(scheme), host_port_pair_(host_port_pair) {
+   if (scheme_ == SCHEME_INVALID) {
+diff --git a/net/base/proxy_server.h b/net/base/proxy_server.h
+index 2a1ff5115555a..9000596da3998 100644
+--- a/net/base/proxy_server.h
++++ b/net/base/proxy_server.h
+@@ -41,10 +41,17 @@ class NET_EXPORT ProxyServer {
+     SCHEME_QUIC = 1 << 6,
+   };
+ 
+-  // Default copy-constructor and assignment operator are OK!
++  // Defined out of line because the credential members below make this a
++  // "complex" class, which chromium-style requires to keep its constructors
++  // and destructor out of headers.
+ 
+   // Constructs an invalid ProxyServer.
+-  ProxyServer() = default;
++  ProxyServer();
++  ProxyServer(const ProxyServer&);
++  ProxyServer(ProxyServer&&) noexcept;
++  ProxyServer& operator=(const ProxyServer&);
++  ProxyServer& operator=(ProxyServer&&) noexcept;
++  ~ProxyServer();
+ 
+   ProxyServer(Scheme scheme, const HostPortPair& host_port_pair);
+ 
+@@ -107,6 +114,20 @@ class NET_EXPORT ProxyServer {
+ 
+   const HostPortPair& host_port_pair() const;
+ 
++  // Credentials carried in the proxy URI's userinfo, for the SOCKS5
++  // username/password subnegotiation of RFC 1929. Empty when the URI gave
++  // none, which is the only case upstream Chromium supports.
++  //
++  // These are only meaningful for SOCKS5. An HTTP proxy authenticates through
++  // HttpAuthCache and the 407 exchange instead, and never reads these.
++  const std::string& username() const { return username_; }
++  const std::string& password() const { return password_; }
++  bool has_credentials() const { return !username_.empty(); }
++  void SetCredentials(std::string username, std::string password) {
++    username_ = std::move(username);
++    password_ = std::move(password);
++  }
++
+   // Returns the default port number for a proxy server with the specified
+   // scheme. Returns -1 if unknown.
+   static int GetDefaultPortForScheme(Scheme scheme);
+@@ -117,6 +138,8 @@ class NET_EXPORT ProxyServer {
+  private:
+   Scheme scheme_ = SCHEME_INVALID;
+   HostPortPair host_port_pair_;
++  std::string username_;
++  std::string password_;
+ };
+ 
+ NET_EXPORT_PRIVATE std::ostream& operator<<(std::ostream& os,
+diff --git a/net/base/proxy_string_util.cc b/net/base/proxy_string_util.cc
+index 8576fc9f3bff6..2bc34f323affb 100644
+--- a/net/base/proxy_string_util.cc
++++ b/net/base/proxy_string_util.cc
+@@ -14,12 +14,15 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/buildflag.h"
+ #include "net/base/proxy_server.h"
+ #include "net/base/url_util.h"
+ #include "net/http/http_util.h"
+ #include "net/net_buildflags.h"
+ #include "url/third_party/mozilla/url_parse.h"
++#include "url/url_canon.h"
++#include "url/url_util.h"
+ 
+ namespace net {
+ 
+@@ -217,8 +220,15 @@ ProxyServer ProxySchemeHostAndPortToProxyServer(
+                       url::ParserMode::kSpecialURL, &username_component,
+                       &password_component, &hostname_component,
+                       &port_component);
+-  if (username_component.is_valid() || password_component.is_valid() ||
+-      hostname_component.is_empty()) {
++  // Credentials in the userinfo are accepted for SOCKS5 only, where they feed
++  // the RFC 1929 username/password subnegotiation. Every other scheme keeps
++  // rejecting them: an HTTP proxy authenticates through HttpAuthCache and the
++  // 407 exchange, so userinfo there would be silently ignored, and refusing it
++  // is better than appearing to honour it.
++  const bool has_userinfo =
++      username_component.is_valid() || password_component.is_valid();
++  const bool credentials_allowed = scheme == ProxyServer::SCHEME_SOCKS5;
++  if ((has_userinfo && !credentials_allowed) || hostname_component.is_empty()) {
+     return ProxyServer();
+   }
+ 
+@@ -236,7 +246,25 @@ ProxyServer ProxySchemeHostAndPortToProxyServer(
+           ? host_and_port.substr(port_component.begin, port_component.len)
+           : "";
+ 
+-  return ProxyServer::FromSchemeHostAndPort(scheme, hostname, port);
++  ProxyServer proxy_server =
++      ProxyServer::FromSchemeHostAndPort(scheme, hostname, port);
++  if (has_userinfo && proxy_server.is_valid()) {
++    // Percent-decoded, because a password is very likely to contain characters
++    // that had to be escaped to survive the URI.
++    auto decode = [&](const url::Component& component) {
++      if (!component.is_nonempty()) {
++        return std::string();
++      }
++      url::RawCanonOutputW<256> decoded;
++      url::DecodeUrlEscapeSequences(
++          host_and_port.substr(component.begin, component.len),
++          url::DecodeUrlMode::kUtf8OrIsomorphic, &decoded);
++      return base::UTF16ToUTF8(decoded.view());
++    };
++    proxy_server.SetCredentials(decode(username_component),
++                                decode(password_component));
++  }
++  return proxy_server;
+ }
+ 
+ ProxyServer::Scheme GetSchemeFromUriScheme(std::string_view scheme,
+diff --git a/net/socket/connect_job_params_factory.cc b/net/socket/connect_job_params_factory.cc
+index 83ba68d5f9e22..7ab677ac70ea8 100644
+--- a/net/socket/connect_job_params_factory.cc
++++ b/net/socket/connect_job_params_factory.cc
+@@ -266,10 +266,16 @@ ConnectJobParams CreateProxyParams(
+     DCHECK_EQ(1u, proxy_chain.length());
+     // TODO(crbug.com/40181080): Pass `endpoint` directly (preserving scheme
+     // when available)?
++    // Credentials come from the proxy URI's userinfo and drive the RFC 1929
++    // subnegotiation. SOCKS4 has no such exchange, so they are passed only for
++    // SOCKS5 and are empty whenever the URI carried none.
++    const bool is_socks_v5 =
++        proxy_server.scheme() == ProxyServer::SCHEME_SOCKS5;
+     params = ConnectJobParams(base::MakeRefCounted<SOCKSSocketParams>(
+-        std::move(params), proxy_server.scheme() == ProxyServer::SCHEME_SOCKS5,
+-        ToHostPortPair(endpoint), network_anonymization_key,
+-        *proxy_annotation_tag));
++        std::move(params), is_socks_v5, ToHostPortPair(endpoint),
++        network_anonymization_key, *proxy_annotation_tag,
++        is_socks_v5 ? proxy_server.username() : std::string(),
++        is_socks_v5 ? proxy_server.password() : std::string()));
+   }
+ 
+   return params;
+diff --git a/net/socket/socks5_client_socket.cc b/net/socket/socks5_client_socket.cc
+index 3eeeb7e204c3d..8c410436dc6ce 100644
+--- a/net/socket/socks5_client_socket.cc
++++ b/net/socket/socks5_client_socket.cc
+@@ -28,9 +28,18 @@ namespace net {
+ const unsigned int SOCKS5ClientSocket::kGreetReadHeaderSize = 2;
+ const unsigned int SOCKS5ClientSocket::kWriteHeaderSize = 10;
+ const unsigned int SOCKS5ClientSocket::kReadHeaderSize = 5;
++// RFC 1929: the reply is a version byte and a status byte.
++const unsigned int SOCKS5ClientSocket::kAuthReadHeaderSize = 2;
+ const uint8_t SOCKS5ClientSocket::kSOCKS5Version = 0x05;
+ const uint8_t SOCKS5ClientSocket::kTunnelCommand = 0x01;
+ const uint8_t SOCKS5ClientSocket::kNullByte = 0x00;
++const uint8_t SOCKS5ClientSocket::kAuthMethodNone = 0x00;
++const uint8_t SOCKS5ClientSocket::kAuthMethodUsernamePassword = 0x02;
++const uint8_t SOCKS5ClientSocket::kAuthMethodUnacceptable = 0xFF;
++const uint8_t SOCKS5ClientSocket::kAuthSubnegotiationVersion = 0x01;
++
++// RFC 1929 gives each field a single length byte.
++static constexpr size_t kMaxCredentialLength = 255;
+ 
+ static_assert(sizeof(struct in_addr) == 4, "incorrect system size of IPv4");
+ static_assert(sizeof(struct in6_addr) == 16, "incorrect system size of IPv6");
+@@ -38,11 +47,15 @@ static_assert(sizeof(struct in6_addr) == 16, "incorrect system size of IPv6");
+ SOCKS5ClientSocket::SOCKS5ClientSocket(
+     std::unique_ptr<StreamSocket> transport_socket,
+     const HostPortPair& destination,
+-    const NetworkTrafficAnnotationTag& traffic_annotation)
++    const NetworkTrafficAnnotationTag& traffic_annotation,
++    std::string username,
++    std::string password)
+     : io_callback_(base::BindRepeating(&SOCKS5ClientSocket::OnIOComplete,
+                                        base::Unretained(this))),
+       transport_socket_(std::move(transport_socket)),
+       destination_(destination),
++      username_(std::move(username)),
++      password_(std::move(password)),
+       net_log_(transport_socket_->NetLog()),
+       traffic_annotation_(traffic_annotation) {}
+ 
+@@ -224,6 +237,20 @@ int SOCKS5ClientSocket::DoLoop(int last_io_result) {
+         net_log_.EndEventWithNetErrorCode(NetLogEventType::SOCKS5_GREET_READ,
+                                           rv);
+         break;
++      case STATE_AUTH_WRITE:
++        DCHECK_EQ(OK, rv);
++        rv = DoAuthWrite();
++        break;
++      case STATE_AUTH_WRITE_COMPLETE:
++        rv = DoAuthWriteComplete(rv);
++        break;
++      case STATE_AUTH_READ:
++        DCHECK_EQ(OK, rv);
++        rv = DoAuthRead();
++        break;
++      case STATE_AUTH_READ_COMPLETE:
++        rv = DoAuthReadComplete(rv);
++        break;
+       case STATE_HANDSHAKE_WRITE:
+         DCHECK_EQ(OK, rv);
+         net_log_.BeginEvent(NetLogEventType::SOCKS5_HANDSHAKE_WRITE);
+@@ -254,6 +281,11 @@ int SOCKS5ClientSocket::DoLoop(int last_io_result) {
+ static constexpr std::array<uint8_t, 3> kSOCKS5GreetWriteData{
+     0x05, 0x01, 0x00};  // no authentication
+ 
++// Offered when credentials are available: the proxy picks one, and a proxy
++// that does not need authentication still answers with "none".
++static constexpr std::array<uint8_t, 4> kSOCKS5GreetWriteDataWithAuth{
++    0x05, 0x02, 0x00, 0x02};
++
+ int SOCKS5ClientSocket::DoGreetWrite() {
+   // Since we only have 1 byte to send the hostname length in, if the
+   // URL has a hostname longer than 255 characters we can't send it.
+@@ -262,9 +294,19 @@ int SOCKS5ClientSocket::DoGreetWrite() {
+     return ERR_SOCKS_CONNECTION_FAILED;
+   }
+ 
++  // Rejected before the greeting, because offering a method whose credentials
++  // cannot be encoded would fail later with a far less obvious error.
++  if (username_.size() > kMaxCredentialLength ||
++      password_.size() > kMaxCredentialLength) {
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++
+   if (!write_buf_) {
+     auto greet_buffer =
+-        base::MakeRefCounted<WrappedIOBuffer>(kSOCKS5GreetWriteData);
++        has_credentials()
++            ? base::MakeRefCounted<WrappedIOBuffer>(
++                  kSOCKS5GreetWriteDataWithAuth)
++            : base::MakeRefCounted<WrappedIOBuffer>(kSOCKS5GreetWriteData);
+     write_buf_ = base::MakeRefCounted<DrainableIOBuffer>(
+         std::move(greet_buffer), greet_buffer->size());
+   }
+@@ -323,11 +365,114 @@ int SOCKS5ClientSocket::DoGreetReadComplete(int result) {
+                                    "version", read_data[0]);
+     return ERR_SOCKS_CONNECTION_FAILED;
+   }
+-  if (read_data[1] != 0x00) {
++  const uint8_t method = read_data[1];
++  if (method != kAuthMethodNone &&
++      !(method == kAuthMethodUsernamePassword && has_credentials())) {
++    // Covers kAuthMethodUnacceptable (0xFF), a method that was never offered,
++    // and username/password chosen when there are no credentials to send.
+     net_log_.AddEventWithIntParams(NetLogEventType::SOCKS_UNEXPECTED_AUTH,
+-                                   "method", read_data[1]);
++                                   "method", method);
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++
++  read_buf_.reset();
++  // A proxy that needs no authentication answers "none" even when both were
++  // offered, so the subnegotiation runs only when it was actually selected.
++  next_state_ = method == kAuthMethodUsernamePassword ? STATE_AUTH_WRITE
++                                                      : STATE_HANDSHAKE_WRITE;
++  return OK;
++}
++
++scoped_refptr<DrainableIOBuffer> SOCKS5ClientSocket::BuildAuthWriteBuffer()
++    const {
++  // RFC 1929 section 2:
++  //     +----+------+----------+------+----------+
++  //     |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
++  //     +----+------+----------+------+----------+
++  //     | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
++  //     +----+------+----------+------+----------+
++  // VER is the subnegotiation's own version, 0x01, not the SOCKS version.
++  std::vector<uint8_t> request;
++  request.reserve(3 + username_.size() + password_.size());
++
++  request.push_back(kAuthSubnegotiationVersion);
++  request.push_back(base::checked_cast<uint8_t>(username_.size()));
++  request.insert(request.end(), username_.begin(), username_.end());
++  request.push_back(base::checked_cast<uint8_t>(password_.size()));
++  request.insert(request.end(), password_.begin(), password_.end());
++
++  auto base_buffer = base::MakeRefCounted<VectorIOBuffer>(std::move(request));
++  return base::MakeRefCounted<DrainableIOBuffer>(std::move(base_buffer),
++                                                 base_buffer->size());
++}
++
++int SOCKS5ClientSocket::DoAuthWrite() {
++  next_state_ = STATE_AUTH_WRITE_COMPLETE;
++
++  if (!write_buf_) {
++    write_buf_ = BuildAuthWriteBuffer();
++  }
++
++  return transport_socket_->Write(write_buf_.get(),
++                                  write_buf_->BytesRemaining(), io_callback_,
++                                  traffic_annotation_);
++}
++
++int SOCKS5ClientSocket::DoAuthWriteComplete(int result) {
++  if (result < 0)
++    return result;
++
++  write_buf_->DidConsume(result);
++  if (write_buf_->BytesRemaining() == 0) {
++    write_buf_.reset();
++    next_state_ = STATE_AUTH_READ;
++  } else {
++    next_state_ = STATE_AUTH_WRITE;
++  }
++  return OK;
++}
++
++int SOCKS5ClientSocket::DoAuthRead() {
++  next_state_ = STATE_AUTH_READ_COMPLETE;
++  if (!read_buf_) {
++    read_buf_ = base::MakeRefCounted<GrowableIOBuffer>();
++    read_buf_->SetCapacity(kAuthReadHeaderSize);
++  }
++  return transport_socket_->Read(read_buf_.get(),
++                                 read_buf_->RemainingCapacity(), io_callback_);
++}
++
++int SOCKS5ClientSocket::DoAuthReadComplete(int result) {
++  if (result < 0)
++    return result;
++
++  if (result == 0) {
++    net_log_.AddEvent(
++        NetLogEventType::SOCKS_UNEXPECTEDLY_CLOSED_DURING_GREETING);
++    return ERR_SOCKS_CONNECTION_FAILED;
++  }
++
++  read_buf_->set_offset(read_buf_->offset() + result);
++  if (read_buf_->RemainingCapacity() > 0) {
++    next_state_ = STATE_AUTH_READ;
++    return OK;
++  }
++
++  base::span<uint8_t> read_data = read_buf_->span_before_offset();
++
++  if (read_data[0] != kAuthSubnegotiationVersion) {
++    net_log_.AddEventWithIntParams(NetLogEventType::SOCKS_UNEXPECTED_VERSION,
++                                   "version", read_data[0]);
+     return ERR_SOCKS_CONNECTION_FAILED;
+   }
++  // RFC 1929: any status but 0x00 is a failure, and the server closes the
++  // connection. Reported separately from a transport failure, because the
++  // caller's remedy is different: fix the credentials, not the network.
++  if (read_data[1] != 0x00) {
++    net_log_.AddEventWithIntParams(NetLogEventType::SOCKS_UNEXPECTED_AUTH,
++                                   "status", read_data[1]);
++    return ERR_PROXY_AUTH_UNSUPPORTED;
++  }
+ 
+   read_buf_.reset();
+   next_state_ = STATE_HANDSHAKE_WRITE;
+diff --git a/net/socket/socks5_client_socket.h b/net/socket/socks5_client_socket.h
+index fe8da4858d692..c1b657db20e97 100644
+--- a/net/socket/socks5_client_socket.h
++++ b/net/socket/socks5_client_socket.h
+@@ -28,7 +28,8 @@ class DrainableIOBuffer;
+ class GrowableIOBuffer;
+ 
+ // This StreamSocket is used to setup a SOCKSv5 handshake with a socks proxy.
+-// Currently no SOCKSv5 authentication is supported.
++// Supports the "no authentication" method, and the username/password
++// subnegotiation of RFC 1929 when credentials are supplied.
+ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+  public:
+   // |destination| contains the hostname and port to which the socket above will
+@@ -37,9 +38,17 @@ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+   // Although SOCKS 5 supports 3 different modes of addressing, we will
+   // always pass it a hostname. This means the DNS resolving is done
+   // proxy side.
++  //
++  // |username| and |password| are offered using the RFC 1929 subnegotiation
++  // when |username| is non-empty. When it is empty only the "no
++  // authentication" method is offered, which is the historical behaviour.
++  // RFC 1929 limits each to 255 bytes; longer values fail the handshake
++  // rather than being truncated into a credential nobody supplied.
+   SOCKS5ClientSocket(std::unique_ptr<StreamSocket> transport_socket,
+                      const HostPortPair& destination,
+-                     const NetworkTrafficAnnotationTag& traffic_annotation);
++                     const NetworkTrafficAnnotationTag& traffic_annotation,
++                     std::string username = std::string(),
++                     std::string password = std::string());
+ 
+   SOCKS5ClientSocket(const SOCKS5ClientSocket&) = delete;
+   SOCKS5ClientSocket& operator=(const SOCKS5ClientSocket&) = delete;
+@@ -82,6 +91,10 @@ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+     STATE_GREET_WRITE_COMPLETE,
+     STATE_GREET_READ,
+     STATE_GREET_READ_COMPLETE,
++    STATE_AUTH_WRITE,
++    STATE_AUTH_WRITE_COMPLETE,
++    STATE_AUTH_READ,
++    STATE_AUTH_READ_COMPLETE,
+     STATE_HANDSHAKE_WRITE,
+     STATE_HANDSHAKE_WRITE_COMPLETE,
+     STATE_HANDSHAKE_READ,
+@@ -99,9 +112,16 @@ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+   static const unsigned int kGreetReadHeaderSize;
+   static const unsigned int kWriteHeaderSize;
+   static const unsigned int kReadHeaderSize;
++  static const unsigned int kAuthReadHeaderSize;
+   static const uint8_t kSOCKS5Version;
+   static const uint8_t kTunnelCommand;
+   static const uint8_t kNullByte;
++  // RFC 1928 method identifiers, and the version of the RFC 1929
++  // subnegotiation, which is numbered separately from SOCKS itself.
++  static const uint8_t kAuthMethodNone;
++  static const uint8_t kAuthMethodUsernamePassword;
++  static const uint8_t kAuthMethodUnacceptable;
++  static const uint8_t kAuthSubnegotiationVersion;
+ 
+   void DoCallback(int result);
+   void OnIOComplete(int result);
+@@ -116,10 +136,19 @@ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+   int DoGreetReadComplete(int result);
+   int DoGreetWrite();
+   int DoGreetWriteComplete(int result);
++  int DoAuthWrite();
++  int DoAuthWriteComplete(int result);
++  int DoAuthRead();
++  int DoAuthReadComplete(int result);
+ 
+   // Creates a DrainableIOBuffer containing the SOCKS handshake.
+   scoped_refptr<DrainableIOBuffer> BuildHandshakeWriteBuffer() const;
+ 
++  // Creates a DrainableIOBuffer containing the RFC 1929 credentials.
++  scoped_refptr<DrainableIOBuffer> BuildAuthWriteBuffer() const;
++
++  bool has_credentials() const { return !username_.empty(); }
++
+   CompletionRepeatingCallback io_callback_;
+ 
+   // Stores the underlying socket.
+@@ -145,6 +174,11 @@ class NET_EXPORT_PRIVATE SOCKS5ClientSocket : public StreamSocket {
+ 
+   const HostPortPair destination_;
+ 
++  // Empty unless the proxy URI carried credentials. Held for the lifetime of
++  // the socket because the handshake may be re-entered after ERR_IO_PENDING.
++  const std::string username_;
++  const std::string password_;
++
+   NetLogWithSource net_log_;
+ 
+   // Traffic annotation for socket control.
+diff --git a/net/socket/socks_connect_job.cc b/net/socket/socks_connect_job.cc
+index a7af8f25be2ec..29b20c3766ba3 100644
+--- a/net/socket/socks_connect_job.cc
++++ b/net/socket/socks_connect_job.cc
+@@ -28,11 +28,15 @@ SOCKSSocketParams::SOCKSSocketParams(
+     bool socks_v5,
+     const HostPortPair& host_port_pair,
+     const NetworkAnonymizationKey& network_anonymization_key,
+-    const NetworkTrafficAnnotationTag& traffic_annotation)
++    const NetworkTrafficAnnotationTag& traffic_annotation,
++    std::string username,
++    std::string password)
+     : transport_params_(nested_params.take_transport()),
+       destination_(host_port_pair),
+       socks_v5_(socks_v5),
+       network_anonymization_key_(network_anonymization_key),
++      username_(std::move(username)),
++      password_(std::move(password)),
+       traffic_annotation_(traffic_annotation) {}
+ 
+ SOCKSSocketParams::~SOCKSSocketParams() = default;
+@@ -178,7 +182,8 @@ int SOCKSConnectJob::DoSOCKSConnect() {
+   if (socks_params_->is_socks_v5()) {
+     socket_ = std::make_unique<SOCKS5ClientSocket>(
+         transport_connect_job_->PassSocket(), socks_params_->destination(),
+-        socks_params_->traffic_annotation());
++        socks_params_->traffic_annotation(), socks_params_->username(),
++        socks_params_->password());
+   } else {
+     auto socks_socket = std::make_unique<SOCKSClientSocket>(
+         transport_connect_job_->PassSocket(), socks_params_->destination(),
+diff --git a/net/socket/socks_connect_job.h b/net/socket/socks_connect_job.h
+index 3fc7dc02d6f30..74aad64b5aa0e 100644
+--- a/net/socket/socks_connect_job.h
++++ b/net/socket/socks_connect_job.h
+@@ -6,6 +6,7 @@
+ #define NET_SOCKET_SOCKS_CONNECT_JOB_H_
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/ref_counted.h"
+@@ -30,11 +31,16 @@ class TransportSocketParams;
+ class NET_EXPORT_PRIVATE SOCKSSocketParams
+     : public base::RefCounted<SOCKSSocketParams> {
+  public:
++  // |username| and |password| are the RFC 1929 credentials, empty unless the
++  // proxy URI carried them. They are ignored for SOCKS4, which has no such
++  // subnegotiation.
+   SOCKSSocketParams(ConnectJobParams nested_params,
+                     bool socks_v5,
+                     const HostPortPair& host_port_pair,
+                     const NetworkAnonymizationKey& network_anonymization_key,
+-                    const NetworkTrafficAnnotationTag& traffic_annotation);
++                    const NetworkTrafficAnnotationTag& traffic_annotation,
++                    std::string username = std::string(),
++                    std::string password = std::string());
+ 
+   SOCKSSocketParams(const SOCKSSocketParams&) = delete;
+   SOCKSSocketParams& operator=(const SOCKSSocketParams&) = delete;
+@@ -52,6 +58,9 @@ class NET_EXPORT_PRIVATE SOCKSSocketParams
+     return traffic_annotation_;
+   }
+ 
++  const std::string& username() const { return username_; }
++  const std::string& password() const { return password_; }
++
+  private:
+   friend class base::RefCounted<SOCKSSocketParams>;
+   ~SOCKSSocketParams();
+@@ -62,6 +71,9 @@ class NET_EXPORT_PRIVATE SOCKSSocketParams
+   const HostPortPair destination_;
+   const bool socks_v5_;
+   const NetworkAnonymizationKey network_anonymization_key_;
++  // RFC 1929 credentials; empty when the proxy URI carried none.
++  const std::string username_;
++  const std::string password_;
+ 
+   NetworkTrafficAnnotationTag traffic_annotation_;
+ };
